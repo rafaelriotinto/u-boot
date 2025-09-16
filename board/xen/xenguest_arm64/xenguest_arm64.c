@@ -149,12 +149,14 @@ static void add_mmio_mem_map(const void *blob, int *cnt)
 						     sizeof("virtio,mmio"))) >= 0) {
 		if (fdt_get_resource(blob, node, "reg", 0, &reg_res) < 0)
 			return;
-		xen_mem_map[*cnt].virt = reg_res.start;
-		xen_mem_map[*cnt].phys = reg_res.start;
+		xen_mem_map[*cnt].virt = rounddown(reg_res.start, PAGE_SIZE);
+		xen_mem_map[*cnt].phys = rounddown(reg_res.start, PAGE_SIZE);
 		xen_mem_map[*cnt].size = roundup(fdt_resource_size(&reg_res), PAGE_SIZE);
-		xen_mem_map[*cnt].attrs = (PTE_BLOCK_MEMTYPE(MT_NORMAL) |
+		xen_mem_map[*cnt].attrs = (PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
 				PTE_BLOCK_INNER_SHARE);
 		(*cnt)++;
+		if ((*cnt) >= MAX_MEM_MAP_REGIONS)
+			break;
 	}
 }
 #endif
