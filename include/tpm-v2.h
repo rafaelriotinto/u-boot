@@ -310,6 +310,7 @@ enum tpm2_handles {
 /**
  * TPM2 command codes used at the beginning of a buffer, gives the command.
  *
+ * @TPM2_CC_SHUTDOWN: TPM2_Shutdown().
  * @TPM2_CC_STARTUP: TPM2_Startup().
  * @TPM2_CC_SELF_TEST: TPM2_SelfTest().
  * @TPM2_CC_CLEAR: TPM2_Clear().
@@ -325,6 +326,7 @@ enum tpm2_handles {
  * @TPM2_CC_PCR_SETAUTHVAL: TPM2_PCR_SetAuthValue().
  */
 enum tpm2_command_codes {
+	TPM2_CC_SHUTDOWN	= 0x0145,
 	TPM2_CC_STARTUP		= 0x0144,
 	TPM2_CC_SELF_TEST	= 0x0143,
 	TPM2_CC_HIER_CONTROL	= 0x0121,

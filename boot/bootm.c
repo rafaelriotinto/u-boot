@@ -926,11 +926,15 @@ int bootm_measure(struct bootm_headers *images)
 {
 	int ret = 0;
 
+	printf("[MBOOT] bootm_measure: enter (os.os=%d)\n", images->os.os);
+
 	/* Skip measurement if EFI is going to do it */
 	if (images->os.os == IH_OS_EFI &&
 	    IS_ENABLED(CONFIG_EFI_TCG2_PROTOCOL) &&
-	    IS_ENABLED(CONFIG_BOOTM_EFI))
+	    IS_ENABLED(CONFIG_BOOTM_EFI)) {
+		printf("[MBOOT] bootm_measure: SKIPPING - EFI TCG2 will handle it\n");
 		return ret;
+	}
 
 	if (IS_ENABLED(CONFIG_MEASURED_BOOT)) {
 		struct tcg2_event_log elog;
@@ -940,54 +944,109 @@ int bootm_measure(struct bootm_headers *images)
 		const char *s;
 		u32 rd_len;
 		bool ign;
+		ulong kernel_start, kernel_len;
 
-		elog.log_size = 0;
+		printf("[MBOOT] bootm_measure: CONFIG_MEASURED_BOOT active\n");
+
+		elog.log_size = SZ_64K;
+		elog.log = malloc(SZ_64K);
+		if (!elog.log) {
+			printf("[MBOOT] bootm_measure: failed to allocate event log\n");
+			return -ENOMEM;
+		}
 		ign = IS_ENABLED(CONFIG_MEASURE_IGNORE_LOG);
 		ret = tcg2_measurement_init(&dev, &elog, ign);
-		if (ret)
+		if (ret) {
+			printf("[MBOOT] bootm_measure: measurement_init FAILED ret=%d\n", ret);
+			free(elog.log);
 			return ret;
+		}
 
-		image_buf = map_sysmem(images->os.image_start,
-				       images->os.image_len);
-		ret = tcg2_measure_data(dev, &elog, 8, images->os.image_len,
+		/*
+		 * bootm sets os.image_start/image_len (via boot_get_kernel),
+		 * but booti only sets os.start/os.end. Fall back to the
+		 * latter so that raw Image boots (booti) get measured too.
+		 *
+		 * For booti, os.end - os.start is the ARM64 Image header's
+		 * image_size which includes BSS. Measuring BSS would hash
+		 * uninitialized memory, producing different values each boot.
+		 * Use the filesize env var (set by the load command) to get
+		 * the actual kernel file size excluding BSS.
+		 */
+		kernel_start = images->os.image_start;
+		kernel_len = images->os.image_len;
+		if (!kernel_start && !kernel_len && images->os.start) {
+			kernel_start = images->os.start;
+			s = env_get("filesize");
+			if (s)
+				kernel_len = hextoul(s, NULL);
+			else
+				kernel_len = images->os.end - images->os.start;
+		}
+
+		printf("[MBOOT] bootm_measure: measuring kernel -> PCR 8 (start=0x%lx, len=0x%lx)\n",
+		       kernel_start, kernel_len);
+		image_buf = map_sysmem(kernel_start, kernel_len);
+		ret = tcg2_measure_data(dev, &elog, 8, kernel_len,
 					image_buf, EV_COMPACT_HASH,
 					strlen("linux") + 1, (u8 *)"linux");
-		if (ret)
+		if (ret) {
+			printf("[MBOOT] bootm_measure: kernel measure FAILED ret=%d\n", ret);
 			goto unmap_image;
+		}
 
 		rd_len = images->rd_end - images->rd_start;
+		printf("[MBOOT] bootm_measure: measuring initrd -> PCR 9 (rd_start=0x%lx, rd_len=0x%x)\n",
+		       images->rd_start, rd_len);
 		initrd_buf = map_sysmem(images->rd_start, rd_len);
 		ret = tcg2_measure_data(dev, &elog, 9, rd_len, initrd_buf,
 					EV_COMPACT_HASH, strlen("initrd") + 1,
 					(u8 *)"initrd");
-		if (ret)
+		if (ret) {
+			printf("[MBOOT] bootm_measure: initrd measure FAILED ret=%d\n", ret);
 			goto unmap_initrd;
+		}
 
 		if (IS_ENABLED(CONFIG_MEASURE_DEVICETREE)) {
+			printf("[MBOOT] bootm_measure: measuring DTB -> PCR 0 (ft_addr=%p, ft_len=0x%x)\n",
+			       images->ft_addr, images->ft_len);
 			ret = tcg2_measure_data(dev, &elog, 0, images->ft_len,
 						(u8 *)images->ft_addr,
 						EV_TABLE_OF_DEVICES,
 						strlen("dts") + 1,
 						(u8 *)"dts");
-			if (ret)
+			if (ret) {
+				printf("[MBOOT] bootm_measure: DTB measure FAILED ret=%d\n", ret);
 				goto unmap_initrd;
+			}
+		} else {
+			printf("[MBOOT] bootm_measure: CONFIG_MEASURE_DEVICETREE not enabled, skipping DTB\n");
 		}
 
 		s = env_get("bootargs");
 		if (!s)
 			s = "";
+		printf("[MBOOT] bootm_measure: measuring bootargs -> PCR 1 (len=%zu)\n",
+		       strlen(s));
 		ret = tcg2_measure_data(dev, &elog, 1, strlen(s) + 1, (u8 *)s,
 					EV_PLATFORM_CONFIG_FLAGS,
 					strlen(s) + 1, (u8 *)s);
+		if (ret)
+			printf("[MBOOT] bootm_measure: bootargs measure FAILED ret=%d\n", ret);
 
 unmap_initrd:
 		unmap_sysmem(initrd_buf);
 
 unmap_image:
 		unmap_sysmem(image_buf);
+		printf("[MBOOT] bootm_measure: calling measurement_term (error=%d)\n", ret != 0);
 		tcg2_measurement_term(dev, &elog, ret != 0);
+		free(elog.log);
+	} else {
+		printf("[MBOOT] bootm_measure: CONFIG_MEASURED_BOOT not enabled\n");
 	}
 
+	printf("[MBOOT] bootm_measure: exit ret=%d\n", ret);
 	return ret;
 }
 

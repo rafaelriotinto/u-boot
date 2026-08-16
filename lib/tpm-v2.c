@@ -531,19 +531,34 @@ int tcg2_measure_data(struct udevice *dev, struct tcg2_event_log *elog,
 	struct tpml_digest_values digest_list;
 	int rc;
 
+	printf("[MBOOT] tcg2_measure_data: PCR %u, event_type=0x%x, data=%p, data_size=%u, event_size=%u\n",
+	       pcr_index, event_type, data, size, event_size);
+
 	if (data)
 		rc = tcg2_create_digest(dev, data, size, &digest_list);
 	else
 		rc = tcg2_create_digest(dev, event, event_size, &digest_list);
-	if (rc)
+	if (rc) {
+		printf("[MBOOT] tcg2_measure_data: create_digest failed rc=%d\n", rc);
 		return rc;
+	}
 
 	rc = tcg2_pcr_extend(dev, pcr_index, &digest_list);
-	if (rc)
+	if (rc) {
+		printf("[MBOOT] tcg2_measure_data: pcr_extend PCR %u failed rc=%d\n",
+		       pcr_index, rc);
 		return rc;
+	}
 
-	return tcg2_log_append_check(elog, pcr_index, event_type, &digest_list,
+	printf("[MBOOT] tcg2_measure_data: PCR %u extended OK\n", pcr_index);
+
+	rc = tcg2_log_append_check(elog, pcr_index, event_type, &digest_list,
 				     event_size, event);
+	if (rc)
+		printf("[MBOOT] tcg2_measure_data: log_append_check failed rc=%d (log_pos=%u, log_size=%u)\n",
+		       rc, elog->log_position, elog->log_size);
+
+	return rc;
 }
 
 int tcg2_log_prepare_buffer(struct udevice *dev, struct tcg2_event_log *elog,
@@ -552,21 +567,32 @@ int tcg2_log_prepare_buffer(struct udevice *dev, struct tcg2_event_log *elog,
 	struct tcg2_event_log log;
 	int rc;
 
+	printf("[MBOOT] tcg2_log_prepare_buffer: enter (ignore=%d, elog->log_size=%u)\n",
+	       ignore_existing_log, elog->log_size);
+
 	elog->log_position = 0;
 	elog->found = false;
 
 	rc = tcg2_platform_get_log(dev, (void **)&log.log, &log.log_size);
 	if (!rc) {
+		printf("[MBOOT] tcg2_log_prepare_buffer: found DT log at %p, size=%u\n",
+		       log.log, log.log_size);
 		log.log_position = 0;
 		log.found = false;
 
 		if (!ignore_existing_log) {
 			rc = tcg2_log_parse(dev, &log);
-			if (rc)
+			if (rc) {
+				printf("[MBOOT] tcg2_log_prepare_buffer: log_parse failed rc=%d\n", rc);
 				return rc;
+			}
+			printf("[MBOOT] tcg2_log_prepare_buffer: log_parse OK (found=%d, log_pos=%u)\n",
+			       log.found, log.log_position);
 		}
 
 		if (elog->log_size) {
+			printf("[MBOOT] tcg2_log_prepare_buffer: caller has buffer (size=%u)\n",
+			       elog->log_size);
 			if (log.found) {
 				if (elog->log_size < log.log_position)
 					return -ENOSPC;
@@ -580,12 +606,16 @@ int tcg2_log_prepare_buffer(struct udevice *dev, struct tcg2_event_log *elog,
 
 			unmap_physmem(log.log, MAP_NOCACHE);
 		} else {
+			printf("[MBOOT] tcg2_log_prepare_buffer: caller has no buffer, using DT log (size=%u)\n",
+			       log.log_size);
 			elog->log = log.log;
 			elog->log_size = log.log_size;
 		}
 
 		elog->log_position = log.log_position;
 		elog->found = log.found;
+	} else {
+		printf("[MBOOT] tcg2_log_prepare_buffer: no DT log found rc=%d\n", rc);
 	}
 
 	/*
@@ -593,9 +623,14 @@ int tcg2_log_prepare_buffer(struct udevice *dev, struct tcg2_event_log *elog,
 	 * valid. User's can pass in their own buffer as a fallback if no
 	 * memory region is found.
 	 */
-	if (!elog->found && elog->log_size)
+	if (!elog->found && elog->log_size) {
+		printf("[MBOOT] tcg2_log_prepare_buffer: initializing fresh log (size=%u)\n",
+		       elog->log_size);
 		rc = tcg2_log_init(dev, elog);
+	}
 
+	printf("[MBOOT] tcg2_log_prepare_buffer: exit rc=%d (log=%p, size=%u, pos=%u, found=%d)\n",
+	       rc, elog->log, elog->log_size, elog->log_position, elog->found);
 	return rc;
 }
 
@@ -604,28 +639,42 @@ int tcg2_measurement_init(struct udevice **dev, struct tcg2_event_log *elog,
 {
 	int rc;
 
+	printf("[MBOOT] tcg2_measurement_init: enter (ignore_existing_log=%d, elog->log_size=%u)\n",
+	       ignore_existing_log, elog->log_size);
+
 	rc = tcg2_platform_get_tpm2(dev);
-	if (rc)
+	if (rc) {
+		printf("[MBOOT] tcg2_measurement_init: get_tpm2 failed rc=%d\n", rc);
 		return rc;
+	}
 
 	rc = tpm_auto_start(*dev);
-	if (rc)
+	if (rc) {
+		printf("[MBOOT] tcg2_measurement_init: tpm_auto_start failed rc=%d\n", rc);
 		return rc;
+	}
 
 	rc = tcg2_log_prepare_buffer(*dev, elog, ignore_existing_log);
 	if (rc) {
+		printf("[MBOOT] tcg2_measurement_init: log_prepare_buffer failed rc=%d, calling term(error)\n", rc);
 		tcg2_measurement_term(*dev, elog, true);
 		return rc;
 	}
 
+	printf("[MBOOT] tcg2_measurement_init: log ready (log=%p, log_size=%u, log_pos=%u, found=%d)\n",
+	       elog->log, elog->log_size, elog->log_position, elog->found);
+
+	printf("[MBOOT] tcg2_measurement_init: measuring S-CRTM version -> PCR 0\n");
 	rc = tcg2_measure_event(*dev, elog, 0, EV_S_CRTM_VERSION,
 				strlen(version_string) + 1,
 				(u8 *)version_string);
 	if (rc) {
+		printf("[MBOOT] tcg2_measurement_init: S-CRTM measure failed rc=%d, calling term(error)\n", rc);
 		tcg2_measurement_term(*dev, elog, true);
 		return rc;
 	}
 
+	printf("[MBOOT] tcg2_measurement_init: complete OK\n");
 	return 0;
 }
 
@@ -634,6 +683,9 @@ void tcg2_measurement_term(struct udevice *dev, struct tcg2_event_log *elog,
 {
 	u32 event = error ? 0x1 : 0xffffffff;
 	int i;
+
+	printf("[MBOOT] tcg2_measurement_term: extending separators PCR 0-7 (error=%d, separator=0x%x)\n",
+	       error, event);
 
 	for (i = 0; i < 8; ++i)
 		tcg2_measure_event(dev, elog, i, EV_SEPARATOR, sizeof(event),
@@ -736,14 +788,20 @@ u32 tpm2_auto_start(struct udevice *dev)
 {
 	u32 rc;
 
+	printf("[MBOOT] tpm2_auto_start: self_test\n");
 	rc = tpm2_self_test(dev, TPMI_YES);
+	printf("[MBOOT] tpm2_auto_start: self_test rc=%u\n", rc);
 
 	if (rc == TPM2_RC_INITIALIZE) {
+		printf("[MBOOT] tpm2_auto_start: TPM not started, issuing Startup(CLEAR)\n");
 		rc = tpm2_startup(dev, TPM2_SU_CLEAR);
-		if (rc)
+		if (rc) {
+			printf("[MBOOT] tpm2_auto_start: Startup(CLEAR) failed rc=%u\n", rc);
 			return rc;
+		}
 
 		rc = tpm2_self_test(dev, TPMI_YES);
+		printf("[MBOOT] tpm2_auto_start: post-startup self_test rc=%u\n", rc);
 	}
 
 	return rc;

@@ -474,8 +474,13 @@ efi_status_t tcg2_measure_pe_image(void *efi, u64 efi_size,
 	IMAGE_NT_HEADERS32 *nt;
 	struct efi_handler *handler;
 
-	if (!is_tcg2_protocol_installed())
+	printf("[MBOOT-EFI] tcg2_measure_pe_image: enter (image_type=%u, size=%llu)\n",
+	       handle->image_type, efi_size);
+
+	if (!is_tcg2_protocol_installed()) {
+		printf("[MBOOT-EFI] tcg2_measure_pe_image: protocol not installed, skip\n");
 		return EFI_SUCCESS;
+	}
 
 	ret = tcg2_platform_get_tpm2(&dev);
 	if (ret != EFI_SUCCESS)
@@ -495,8 +500,13 @@ efi_status_t tcg2_measure_pe_image(void *efi, u64 efi_size,
 		event_type = EV_EFI_RUNTIME_SERVICES_DRIVER;
 		break;
 	default:
+		printf("[MBOOT-EFI] tcg2_measure_pe_image: unsupported image type %u\n",
+		       handle->image_type);
 		return EFI_UNSUPPORTED;
 	}
+
+	printf("[MBOOT-EFI] tcg2_measure_pe_image: measuring PE image -> PCR %u (event_type=0x%x)\n",
+	       pcr_index, event_type);
 
 	ret = tcg2_hash_pe_image(efi, efi_size, &digest_list);
 	if (ret != EFI_SUCCESS)
@@ -505,6 +515,8 @@ efi_status_t tcg2_measure_pe_image(void *efi, u64 efi_size,
 	ret = tcg2_pcr_extend(dev, pcr_index, &digest_list);
 	if (ret != EFI_SUCCESS)
 		return ret;
+
+	printf("[MBOOT-EFI] tcg2_measure_pe_image: PCR %u extended OK\n", pcr_index);
 
 	ret = efi_search_protocol(&handle->header,
 				  &efi_guid_loaded_image_device_path, &handler);
@@ -854,6 +866,9 @@ static efi_status_t measure_event(struct udevice *dev, u32 pcr_index,
 	struct tpml_digest_values digest_list;
 	efi_status_t ret;
 
+	printf("[MBOOT-EFI] measure_event: PCR %u, event_type=0x%x, size=%u\n",
+	       pcr_index, event_type, size);
+
 	ret = tcg2_create_digest(dev, event, size, &digest_list);
 	if (ret != EFI_SUCCESS)
 		goto out;
@@ -862,10 +877,15 @@ static efi_status_t measure_event(struct udevice *dev, u32 pcr_index,
 	if (ret != EFI_SUCCESS)
 		goto out;
 
+	printf("[MBOOT-EFI] measure_event: PCR %u extended OK\n", pcr_index);
+
 	ret = tcg2_agile_log_append(pcr_index, event_type, &digest_list,
 				    size, event);
 
 out:
+	if (ret != EFI_SUCCESS)
+		printf("[MBOOT-EFI] measure_event: PCR %u FAILED ret=0x%lx\n",
+		       pcr_index, (unsigned long)ret);
 	return ret;
 }
 
@@ -881,8 +901,10 @@ static efi_status_t efi_append_scrtm_version(struct udevice *dev)
 {
 	efi_status_t ret;
 
+	printf("[MBOOT-EFI] efi_append_scrtm_version: measuring S-CRTM -> PCR 0\n");
 	ret = measure_event(dev, 0, EV_S_CRTM_VERSION,
 			    strlen(version_string) + 1, (u8 *)version_string);
+	printf("[MBOOT-EFI] efi_append_scrtm_version: ret=0x%lx\n", (unsigned long)ret);
 
 	return ret;
 }
@@ -901,6 +923,8 @@ static efi_status_t efi_init_event_log(void)
 	struct tcg2_event_log elog;
 	struct udevice *dev;
 	efi_status_t ret;
+
+	printf("[MBOOT-EFI] efi_init_event_log: enter\n");
 
 	ret = tcg2_platform_get_tpm2(&dev);
 	if (ret != EFI_SUCCESS)
@@ -934,19 +958,27 @@ static efi_status_t efi_init_event_log(void)
 	elog.log = event_log.buffer;
 	elog.log_size = TPM2_EVENT_LOG_SIZE;
 	ret = tcg2_log_prepare_buffer(dev, &elog, false);
-	if (ret != EFI_SUCCESS)
+	if (ret != EFI_SUCCESS) {
+		printf("[MBOOT-EFI] efi_init_event_log: log_prepare_buffer FAILED ret=0x%lx\n",
+		       (unsigned long)ret);
 		goto free_pool;
+	}
 
 	event_log.pos = elog.log_position;
+	printf("[MBOOT-EFI] efi_init_event_log: log ready (found=%d, pos=%u)\n",
+	       elog.found, elog.log_position);
 
 	/*
 	 * Add SCRTM version to the log if previous firmmware
 	 * doesn't pass an eventlog.
 	 */
 	if (!elog.found) {
+		printf("[MBOOT-EFI] efi_init_event_log: no prior firmware log, adding S-CRTM\n");
 		ret = efi_append_scrtm_version(dev);
 		if (ret != EFI_SUCCESS)
 			goto free_pool;
+	} else {
+		printf("[MBOOT-EFI] efi_init_event_log: prior firmware log found, skipping S-CRTM\n");
 	}
 
 	ret = create_final_event();
@@ -1303,8 +1335,12 @@ efi_status_t efi_tcg2_measure_dtb(void *dtb)
 	efi_status_t ret;
 	u32 event_size;
 
-	if (!is_tcg2_protocol_installed())
+	printf("[MBOOT-EFI] efi_tcg2_measure_dtb: measuring DTB -> PCR 0 (dtb=%p)\n", dtb);
+
+	if (!is_tcg2_protocol_installed()) {
+		printf("[MBOOT-EFI] efi_tcg2_measure_dtb: protocol not installed, skip\n");
 		return EFI_SUCCESS;
+	}
 
 	ret = tcg2_platform_get_tpm2(&dev);
 	if (ret != EFI_SUCCESS)
@@ -1350,20 +1386,31 @@ efi_status_t efi_tcg2_measure_efi_app_invocation(struct efi_loaded_image_obj *ha
 	u32 event = 0;
 	struct smbios3_entry *entry;
 
-	if (!is_tcg2_protocol_installed())
-		return EFI_SUCCESS;
+	printf("[MBOOT-EFI] === efi_tcg2_measure_efi_app_invocation: ENTER ===\n");
 
-	if (tcg2_efi_app_invoked)
+	if (!is_tcg2_protocol_installed()) {
+		printf("[MBOOT-EFI] efi_app_invocation: protocol not installed, skip\n");
 		return EFI_SUCCESS;
+	}
+
+	if (tcg2_efi_app_invoked) {
+		printf("[MBOOT-EFI] efi_app_invocation: already invoked, skip\n");
+		return EFI_SUCCESS;
+	}
 
 	ret = tcg2_platform_get_tpm2(&dev);
 	if (ret != EFI_SUCCESS)
 		return EFI_SECURITY_VIOLATION;
 
+	printf("[MBOOT-EFI] efi_app_invocation: measuring boot variables -> PCR 1\n");
 	ret = tcg2_measure_boot_variable(dev);
-	if (ret != EFI_SUCCESS)
+	if (ret != EFI_SUCCESS) {
+		printf("[MBOOT-EFI] efi_app_invocation: boot_variable FAILED ret=0x%lx\n",
+		       (unsigned long)ret);
 		goto out;
+	}
 
+	printf("[MBOOT-EFI] efi_app_invocation: measuring EFI action -> PCR 4\n");
 	ret = measure_event(dev, 4, EV_EFI_ACTION,
 			    strlen(EFI_CALLING_EFI_APPLICATION),
 			    (u8 *)EFI_CALLING_EFI_APPLICATION);
@@ -1372,15 +1419,23 @@ efi_status_t efi_tcg2_measure_efi_app_invocation(struct efi_loaded_image_obj *ha
 
 	entry = efi_get_configuration_table(&smbios3_guid);
 	if (entry) {
+		printf("[MBOOT-EFI] efi_app_invocation: measuring SMBIOS -> PCR 1\n");
 		ret = tcg2_measure_smbios(dev, entry);
 		if (ret != EFI_SUCCESS)
 			goto out;
+	} else {
+		printf("[MBOOT-EFI] efi_app_invocation: no SMBIOS table, skip\n");
 	}
 
+	printf("[MBOOT-EFI] efi_app_invocation: measuring GPT -> PCR 5\n");
 	ret = tcg2_measure_gpt_data(dev, handle);
-	if (ret != EFI_SUCCESS)
+	if (ret != EFI_SUCCESS) {
+		printf("[MBOOT-EFI] efi_app_invocation: GPT measure FAILED ret=0x%lx\n",
+		       (unsigned long)ret);
 		goto out;
+	}
 
+	printf("[MBOOT-EFI] efi_app_invocation: extending separators -> PCRs 0-7\n");
 	for (pcr_index = 0; pcr_index <= 7; pcr_index++) {
 		ret = measure_event(dev, pcr_index, EV_SEPARATOR,
 				    sizeof(event), (u8 *)&event);
@@ -1388,8 +1443,12 @@ efi_status_t efi_tcg2_measure_efi_app_invocation(struct efi_loaded_image_obj *ha
 			goto out;
 	}
 
+	printf("[MBOOT-EFI] === efi_app_invocation: COMPLETE OK ===\n");
 	tcg2_efi_app_invoked = true;
 out:
+	if (ret != EFI_SUCCESS)
+		printf("[MBOOT-EFI] efi_app_invocation: FAILED ret=0x%lx\n",
+		       (unsigned long)ret);
 	return ret;
 }
 
@@ -1430,9 +1489,12 @@ efi_tcg2_notify_exit_boot_services(struct efi_event *event, void *context)
 
 	EFI_ENTRY("%p, %p", event, context);
 
+	printf("[MBOOT-EFI] === efi_tcg2_notify_exit_boot_services: ENTER ===\n");
+
 	event_log.ebs_called = true;
 
 	if (!is_tcg2_protocol_installed()) {
+		printf("[MBOOT-EFI] exit_boot_services: protocol not installed, skip\n");
 		ret = EFI_SUCCESS;
 		goto out;
 	}
@@ -1441,16 +1503,19 @@ efi_tcg2_notify_exit_boot_services(struct efi_event *event, void *context)
 	if (ret != EFI_SUCCESS)
 		goto out;
 
+	printf("[MBOOT-EFI] exit_boot_services: measuring invocation -> PCR 5\n");
 	ret = measure_event(dev, 5, EV_EFI_ACTION,
 			    strlen(EFI_EXIT_BOOT_SERVICES_INVOCATION),
 			    (u8 *)EFI_EXIT_BOOT_SERVICES_INVOCATION);
 	if (ret != EFI_SUCCESS)
 		goto out;
 
+	printf("[MBOOT-EFI] exit_boot_services: measuring succeeded -> PCR 5\n");
 	ret = measure_event(dev, 5, EV_EFI_ACTION,
 			    strlen(EFI_EXIT_BOOT_SERVICES_SUCCEEDED),
 			    (u8 *)EFI_EXIT_BOOT_SERVICES_SUCCEEDED);
 
+	printf("[MBOOT-EFI] === exit_boot_services: COMPLETE ===\n");
 out:
 	EFI_EXIT(ret);
 }
@@ -1510,6 +1575,9 @@ static efi_status_t tcg2_measure_secure_boot_variable(struct udevice *dev)
 	if (ret != EFI_SUCCESS || !deployed_mode)
 		deployed_audit_pcr_index = 7;
 
+	printf("[MBOOT-EFI] tcg2_measure_secure_boot_variable: deployed_audit_pcr=%u\n",
+	       deployed_audit_pcr_index);
+
 	count = ARRAY_SIZE(secure_variables);
 	for (i = 0; i < count; i++) {
 		const efi_guid_t *guid;
@@ -1517,21 +1585,31 @@ static efi_status_t tcg2_measure_secure_boot_variable(struct udevice *dev)
 		guid = efi_auth_var_get_guid(secure_variables[i].name);
 
 		data = efi_get_var(secure_variables[i].name, guid, &data_size);
-		if (!data && !secure_variables[i].accept_empty)
+		if (!data && !secure_variables[i].accept_empty) {
+			printf("[MBOOT-EFI]   secure_var[%u] \"%ls\": no data, skip (accept_empty=%d)\n",
+			       i, secure_variables[i].name, secure_variables[i].accept_empty);
 			continue;
+		}
 
 		if (u16_strcmp(u"DeployedMode", secure_variables[i].name))
 			secure_variables[i].pcr_index = deployed_audit_pcr_index;
 		if (u16_strcmp(u"AuditMode", secure_variables[i].name))
 			secure_variables[i].pcr_index = deployed_audit_pcr_index;
 
+		printf("[MBOOT-EFI]   secure_var[%u] \"%ls\": PCR %u, data_size=%lu\n",
+		       i, secure_variables[i].name, secure_variables[i].pcr_index,
+		       (unsigned long)data_size);
+
 		ret = tcg2_measure_variable(dev, secure_variables[i].pcr_index,
 					    EV_EFI_VARIABLE_DRIVER_CONFIG,
 					    secure_variables[i].name, guid,
 					    data_size, data);
 		free(data);
-		if (ret != EFI_SUCCESS)
+		if (ret != EFI_SUCCESS) {
+			printf("[MBOOT-EFI]   secure_var[%u] measure FAILED ret=0x%lx\n",
+			       i, (unsigned long)ret);
 			goto error;
+		}
 	}
 
 error:
@@ -1548,18 +1626,27 @@ efi_status_t efi_tcg2_do_initial_measurement(void)
 	efi_status_t ret;
 	struct udevice *dev;
 
-	if (!is_tcg2_protocol_installed())
+	printf("[MBOOT-EFI] === efi_tcg2_do_initial_measurement: ENTER ===\n");
+
+	if (!is_tcg2_protocol_installed()) {
+		printf("[MBOOT-EFI] efi_tcg2_do_initial_measurement: protocol not installed, skip\n");
 		return EFI_SUCCESS;
+	}
 
 	ret = tcg2_platform_get_tpm2(&dev);
 	if (ret != EFI_SUCCESS)
 		return EFI_SECURITY_VIOLATION;
 
+	printf("[MBOOT-EFI] efi_tcg2_do_initial_measurement: measuring secure boot variables -> PCR 7\n");
 	ret = tcg2_measure_secure_boot_variable(dev);
 	if (ret != EFI_SUCCESS)
 		goto out;
 
+	printf("[MBOOT-EFI] efi_tcg2_do_initial_measurement: COMPLETE OK\n");
 out:
+	if (ret != EFI_SUCCESS)
+		printf("[MBOOT-EFI] efi_tcg2_do_initial_measurement: FAILED ret=0x%lx\n",
+		       (unsigned long)ret);
 	return ret;
 }
 
@@ -1577,21 +1664,29 @@ efi_status_t efi_tcg2_register(void)
 	struct efi_event *event;
 	u32 err;
 
+	printf("[MBOOT-EFI] === efi_tcg2_register: ENTER ===\n");
+
 	ret = tcg2_platform_get_tpm2(&dev);
 	if (ret != EFI_SUCCESS) {
+		printf("[MBOOT-EFI] efi_tcg2_register: no TPM device found\n");
 		log_warning("Missing TPMv2 device for EFI_TCG_PROTOCOL\n");
 		return EFI_SUCCESS;
 	}
 
+	printf("[MBOOT-EFI] efi_tcg2_register: TPM device found, calling tpm_auto_start\n");
 	/* initialize the TPM as early as possible. */
 	err = tpm_auto_start(dev);
 	if (err) {
+		printf("[MBOOT-EFI] efi_tcg2_register: tpm_auto_start FAILED err=%u\n", err);
 		log_err("TPM startup failed\n");
 		goto fail;
 	}
 
+	printf("[MBOOT-EFI] efi_tcg2_register: calling efi_init_event_log\n");
 	ret = efi_init_event_log();
 	if (ret != EFI_SUCCESS) {
+		printf("[MBOOT-EFI] efi_tcg2_register: efi_init_event_log FAILED ret=0x%lx\n",
+		       (unsigned long)ret);
 		tcg2_uninit();
 		goto fail;
 	}
@@ -1611,6 +1706,7 @@ efi_status_t efi_tcg2_register(void)
 		goto fail;
 	}
 
+	printf("[MBOOT-EFI] === efi_tcg2_register: COMPLETE OK ===\n");
 	return ret;
 
 fail:
