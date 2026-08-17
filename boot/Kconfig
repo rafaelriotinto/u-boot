@@ -814,6 +814,19 @@ if MEASURED_BOOT
 	  Therefore, it should not be measured into the TPM. In that case,
 	  disable the measurement here.
 
+	config MEASURE_DEVICETREE_SANITIZE
+	bool "Strip boot-varying properties before measuring the devicetree"
+	depends on MEASURE_DEVICETREE
+	help
+	  On some platforms the firmware injects boot-varying data into the
+	  devicetree it hands over (e.g. random seeds, reset counters and
+	  reset reasons), which makes the devicetree measurement differ on
+	  every boot and defeats attestation. When enabled, the devicetree
+	  is copied, the known boot-varying properties and nodes are deleted
+	  from the copy, the copy is repacked, and the measurement is
+	  performed on the sanitized copy. The devicetree handed to the
+	  operating system is not modified.
+
 	config MEASURE_IGNORE_LOG
 	bool "Ignore the existing event log"
 	default n

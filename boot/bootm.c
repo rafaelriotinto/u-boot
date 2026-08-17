@@ -922,6 +922,80 @@ int bootm_process_cmdline_env(int flags)
 	return 0;
 }
 
+/*
+ * Boot-varying content injected into the devicetree by the platform
+ * firmware, which must not be part of the DTB measurement. Verified on
+ * Raspberry Pi 5 (cold vs. warm boot device tree diff): the random
+ * /chosen/kaslr-seed and /chosen/rng-seed, and the /chosen/bootloader
+ * node (reset reason 'rsts' and reset counter 'count') are the only
+ * properties that change between boots.
+ */
+static const char * const dtb_strip_props[] = {
+	"kaslr-seed",
+	"rng-seed",
+};
+
+static const char * const dtb_strip_nodes[] = {
+	"bootloader",
+};
+
+/*
+ * Measure a sanitized copy of the devicetree into PCR 0: copy the blob,
+ * delete the boot-varying properties/nodes listed above, repack (so that
+ * neither the deleted bytes nor blob padding influence the digest), and
+ * hash the result. The original devicetree handed to the OS is untouched.
+ */
+static int tcg2_measure_dtb_sanitized(struct udevice *dev,
+				      struct tcg2_event_log *elog,
+				      void *fdt, u32 fdt_len)
+{
+	void *buf;
+	int nodeoff;
+	int err;
+	int i;
+	int ret;
+
+	buf = malloc(fdt_len + SZ_4K);
+	if (!buf)
+		return -ENOMEM;
+
+	err = fdt_open_into(fdt, buf, fdt_len + SZ_4K);
+	if (err) {
+		printf("[MBOOT] dtb_sanitize: fdt_open_into failed (%d)\n",
+		       err);
+		ret = -EINVAL;
+		goto out;
+	}
+
+	nodeoff = fdt_path_offset(buf, "/chosen");
+	if (nodeoff >= 0) {
+		for (i = 0; i < ARRAY_SIZE(dtb_strip_props); i++) {
+			err = fdt_delprop(buf, nodeoff, dtb_strip_props[i]);
+			if (err && err != -FDT_ERR_NOTFOUND)
+				printf("[MBOOT] dtb_sanitize: delprop %s failed (%d)\n",
+				       dtb_strip_props[i], err);
+		}
+		for (i = 0; i < ARRAY_SIZE(dtb_strip_nodes); i++) {
+			int sub = fdt_subnode_offset(buf, nodeoff,
+						     dtb_strip_nodes[i]);
+			if (sub >= 0)
+				fdt_del_node(buf, sub);
+		}
+	}
+
+	fdt_pack(buf);
+
+	printf("[MBOOT] dtb_sanitize: measuring sanitized DTB -> PCR 0 (len 0x%x -> 0x%x)\n",
+	       fdt_len, fdt_totalsize(buf));
+
+	ret = tcg2_measure_data(dev, elog, 0, fdt_totalsize(buf), buf,
+				EV_TABLE_OF_DEVICES, strlen("dts") + 1,
+				(u8 *)"dts");
+out:
+	free(buf);
+	return ret;
+}
+
 int bootm_measure(struct bootm_headers *images)
 {
 	int ret = 0;
@@ -1010,11 +1084,17 @@ int bootm_measure(struct bootm_headers *images)
 		if (IS_ENABLED(CONFIG_MEASURE_DEVICETREE)) {
 			printf("[MBOOT] bootm_measure: measuring DTB -> PCR 0 (ft_addr=%p, ft_len=0x%x)\n",
 			       images->ft_addr, images->ft_len);
-			ret = tcg2_measure_data(dev, &elog, 0, images->ft_len,
-						(u8 *)images->ft_addr,
-						EV_TABLE_OF_DEVICES,
-						strlen("dts") + 1,
-						(u8 *)"dts");
+			if (IS_ENABLED(CONFIG_MEASURE_DEVICETREE_SANITIZE))
+				ret = tcg2_measure_dtb_sanitized(dev, &elog,
+								 images->ft_addr,
+								 images->ft_len);
+			else
+				ret = tcg2_measure_data(dev, &elog, 0,
+							images->ft_len,
+							(u8 *)images->ft_addr,
+							EV_TABLE_OF_DEVICES,
+							strlen("dts") + 1,
+							(u8 *)"dts");
 			if (ret) {
 				printf("[MBOOT] bootm_measure: DTB measure FAILED ret=%d\n", ret);
 				goto unmap_initrd;
