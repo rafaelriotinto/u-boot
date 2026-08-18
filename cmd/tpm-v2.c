@@ -356,6 +356,73 @@ static int do_tpm_pcr_setauthvalue(struct cmd_tbl *cmdtp, int flag,
 							key, key_sz));
 }
 
+/*
+ * tpm2 nvextend <index> <auth_string> <data_addr> <data_len>
+ *
+ * Extend <data_len> bytes at <data_addr> into the TPM_NT_EXTEND NV index
+ * <index>, authorized by a policy session (PolicyAuthValue) proving the index
+ * authValue <auth_string> over an HMAC session. Test harness for the
+ * measured-boot NV extend implementation.
+ */
+static int do_tpm2_nv_extend(struct cmd_tbl *cmdtp, int flag, int argc,
+			     char *const argv[])
+{
+	struct tpm2_auth_session session;
+	struct udevice *dev;
+	u32 index, data_len, rc;
+	const char *auth;
+	u8 nv_name[68];
+	u32 nv_name_len = sizeof(nv_name);
+	void *data;
+	int ret;
+
+	if (argc != 5)
+		return CMD_RET_USAGE;
+
+	index = simple_strtoul(argv[1], NULL, 0);
+	auth = argv[2];
+	data = map_sysmem(simple_strtoul(argv[3], NULL, 0), 0);
+	data_len = simple_strtoul(argv[4], NULL, 0);
+
+	ret = get_tpm(&dev);
+	if (ret)
+		return ret;
+
+	rc = tpm2_nv_read_public(dev, index, nv_name, &nv_name_len);
+	if (rc) {
+		printf("nv_read_public failed\n");
+		goto out;
+	}
+	printf("NV name (%u bytes): ", nv_name_len);
+	print_byte_string(nv_name, nv_name_len);
+
+	rc = tpm2_start_auth_session(dev, TPM_SE_POLICY, &session);
+	if (rc) {
+		printf("start_auth_session failed\n");
+		goto out;
+	}
+	printf("policy session handle 0x%08x\n", session.handle);
+
+	rc = tpm2_policy_auth_value(dev, &session);
+	if (rc) {
+		printf("policy_auth_value failed\n");
+		tpm2_flush_context(dev, session.handle);
+		goto out;
+	}
+
+	rc = tpm2_nv_extend(dev, index, nv_name, nv_name_len,
+			    (const u8 *)auth, strlen(auth), &session,
+			    data, data_len);
+
+	tpm2_flush_context(dev, session.handle);
+
+	if (!rc)
+		printf("NV extend OK\n");
+out:
+	unmap_sysmem(data);
+	return report_return_code(rc);
+}
+
 static struct cmd_tbl tpm2_commands[] = {
 	U_BOOT_CMD_MKENT(device, 0, 1, do_tpm_device, "", ""),
 	U_BOOT_CMD_MKENT(info, 0, 1, do_tpm_info, "", ""),
@@ -375,6 +442,7 @@ static struct cmd_tbl tpm2_commands[] = {
 			 do_tpm_pcr_setauthpolicy, "", ""),
 	U_BOOT_CMD_MKENT(pcr_setauthvalue, 0, 1,
 			 do_tpm_pcr_setauthvalue, "", ""),
+	U_BOOT_CMD_MKENT(nvextend, 0, 1, do_tpm2_nv_extend, "", ""),
 };
 
 struct cmd_tbl *get_tpm2_commands(unsigned int *size)

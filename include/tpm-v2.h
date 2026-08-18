@@ -301,10 +301,24 @@ enum tpm2_startup_types {
  */
 enum tpm2_handles {
 	TPM2_RH_OWNER		= 0x40000001,
+	TPM2_RH_NULL		= 0x40000007,
 	TPM2_RS_PW		= 0x40000009,
 	TPM2_RH_LOCKOUT		= 0x4000000A,
 	TPM2_RH_ENDORSEMENT	= 0x4000000B,
 	TPM2_RH_PLATFORM	= 0x4000000C,
+};
+
+/**
+ * TPM2 session types, passed to TPM2_StartAuthSession().
+ *
+ * @TPM_SE_HMAC:   an HMAC session
+ * @TPM_SE_POLICY: a policy session (Enhanced Authorization)
+ * @TPM_SE_TRIAL:  a trial session (computes a policy digest without enforcing)
+ */
+enum tpm2_session_type {
+	TPM_SE_HMAC		= 0x00,
+	TPM_SE_POLICY		= 0x01,
+	TPM_SE_TRIAL		= 0x03,
 };
 
 /**
@@ -335,7 +349,12 @@ enum tpm2_command_codes {
 	TPM2_CC_HIERCHANGEAUTH	= 0x0129,
 	TPM2_CC_NV_DEFINE_SPACE	= 0x012a,
 	TPM2_CC_PCR_SETAUTHPOL	= 0x012C,
+	TPM2_CC_NV_EXTEND	= 0x0136,
 	TPM2_CC_NV_WRITE	= 0x0137,
+	TPM2_CC_FLUSH_CONTEXT	= 0x0165,
+	TPM2_CC_NV_READ_PUBLIC	= 0x0169,
+	TPM2_CC_POLICY_AUTH_VALUE = 0x016B,
+	TPM2_CC_START_AUTH_SESSION = 0x0176,
 	TPM2_CC_NV_WRITELOCK	= 0x0138,
 	TPM2_CC_DAM_RESET	= 0x0139,
 	TPM2_CC_DAM_PARAMETERS	= 0x013A,
@@ -755,6 +774,106 @@ u32 tpm2_nv_read_value(struct udevice *dev, u32 index, void *data, u32 count);
  */
 u32 tpm2_nv_write_value(struct udevice *dev, u32 index, const void *data,
 			u32 count);
+
+/* Size of a SHA-256 nonce / policy session nonce */
+#define TPM2_NONCE_SIZE		32
+
+/**
+ * struct tpm2_auth_session - carries a TPM2 authorization session across calls
+ *
+ * @handle:		session handle returned by TPM2_StartAuthSession
+ * @nonce_tpm:		most recent nonce produced by the TPM for this session
+ * @nonce_tpm_size:	length of @nonce_tpm
+ * @nonce_caller:	nonce supplied by the caller (kept for HMAC computation)
+ * @nonce_caller_size:	length of @nonce_caller
+ */
+struct tpm2_auth_session {
+	u32 handle;
+	u8  nonce_tpm[TPM2_NONCE_SIZE];
+	u16 nonce_tpm_size;
+	u8  nonce_caller[TPM2_NONCE_SIZE];
+	u16 nonce_caller_size;
+};
+
+/**
+ * Compute HMAC-SHA256. U-Boot only ships sha1_hmac, so this is provided for the
+ * TPM2 policy/HMAC session authorization used by measured boot.
+ *
+ * @key		HMAC key
+ * @key_len	key length in bytes
+ * @msg		message to authenticate
+ * @msg_len	message length in bytes
+ * @out		output buffer, must be SHA256_SUM_LEN (32) bytes
+ */
+void hmac_sha256(const u8 *key, size_t key_len, const u8 *msg, size_t msg_len,
+		 u8 *out);
+
+/**
+ * Issue a TPM2_StartAuthSession command creating an unsalted, unbound policy
+ * (or HMAC/trial) session with SHA-256 as the session hash.
+ *
+ * @dev		TPM device
+ * @session_type TPM_SE_POLICY / TPM_SE_HMAC / TPM_SE_TRIAL
+ * @session	[out] filled with the session handle and the TPM nonce
+ * Return: code of the operation
+ */
+u32 tpm2_start_auth_session(struct udevice *dev, u8 session_type,
+			    struct tpm2_auth_session *session);
+
+/**
+ * Issue a TPM2_PolicyAuthValue command, binding the session to prove the
+ * authorized entity's authValue via the session HMAC.
+ *
+ * @dev		TPM device
+ * @session	the (policy) session to update
+ * Return: code of the operation
+ */
+u32 tpm2_policy_auth_value(struct udevice *dev,
+			   struct tpm2_auth_session *session);
+
+/**
+ * Issue a TPM2_NV_Extend command, extending @data into a TPM_NT_EXTEND NV
+ * index (NV_new = SHA256(NV_old || data)), authorized through @session whose
+ * policy requires the index authValue (@auth_value).
+ *
+ * @dev		TPM device
+ * @index	NV index (without HR_NV_INDEX)
+ * @nv_name	the NV index Name (nameAlg||digest), from TPM2_NV_ReadPublic
+ * @nv_name_len	length of @nv_name (34 for SHA-256)
+ * @auth_value	the index authValue ("factory secret")
+ * @auth_len	length of @auth_value
+ * @session	policy session already carrying PolicyAuthValue
+ * @data	measurement to extend
+ * @count	length of @data
+ * Return: code of the operation
+ */
+u32 tpm2_nv_extend(struct udevice *dev, u32 index,
+		   const u8 *nv_name, u32 nv_name_len,
+		   const u8 *auth_value, u32 auth_len,
+		   struct tpm2_auth_session *session,
+		   const void *data, u32 count);
+
+/**
+ * Issue a TPM2_NV_ReadPublic command, returning the NV index Name (needed as
+ * an input to the NV_Extend cpHash computation).
+ *
+ * @dev		TPM device
+ * @index	NV index (without HR_NV_INDEX)
+ * @nv_name	[out] buffer for the Name
+ * @nv_name_len	[in/out] buffer size / bytes written
+ * Return: code of the operation
+ */
+u32 tpm2_nv_read_public(struct udevice *dev, u32 index,
+			u8 *nv_name, u32 *nv_name_len);
+
+/**
+ * Issue a TPM2_FlushContext command, freeing a loaded session/object.
+ *
+ * @dev		TPM device
+ * @handle	handle to flush
+ * Return: code of the operation
+ */
+u32 tpm2_flush_context(struct udevice *dev, u32 handle);
 
 /**
  * Issue a TPM2_PCR_Read command.
