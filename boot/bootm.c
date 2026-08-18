@@ -998,28 +998,59 @@ out:
 }
 
 #if CONFIG_IS_ENABLED(MEASURE_NV_EXTEND)
+/* Domain-separation context for the DUID-derived NV authValue. Must match the
+ * provisioning step (provisioning/nv-extend/provision-nv-index.sh). */
+#define MEASURE_NV_AUTH_CTX	"rp5-nv-auth-v1"
+
 /*
- * Factory secret authorizing the NV extend index. For now this is a fixed
- * demo value compiled into the (secure-boot-signed) U-Boot binary; the design
- * calls for deriving it from the SoC DUID / OTP so it is not carried on the SD
- * card (see rp5_tpm_secure_boot/docs/hardening-and-secret-storage.md).
+ * Derive the NV index authValue ("factory secret") from the SoC DUID that the
+ * firmware exposes at /chosen/rpi-duid in the device tree. The DUID lives in
+ * OTP (not on the SD card) and is read here inside the SoC, so the secret is
+ * never carried on removable media. The provisioning step derives the same
+ * value identically. See docs/hardening-and-secret-storage.md.
  */
-static const u8 measure_factory_secret[] = "demo-factory-secret";
+static int measure_factory_secret(const void *fdt, u8 secret[TPM2_DIGEST_LEN])
+{
+	sha256_context ctx;
+	const void *duid;
+	int node, len;
+
+	node = fdt_path_offset(fdt, "/chosen");
+	if (node < 0)
+		return -1;
+	duid = fdt_getprop(fdt, node, "rpi-duid", &len);
+	if (!duid || len <= 0)
+		return -1;
+
+	sha256_starts(&ctx);
+	sha256_update(&ctx, (const u8 *)MEASURE_NV_AUTH_CTX,
+		      strlen(MEASURE_NV_AUTH_CTX));
+	sha256_update(&ctx, duid, len);
+	sha256_finish(&ctx, secret);
+	return 0;
+}
 
 /*
  * Extend @len bytes at @data into the measured-boot NV extend index, using the
  * same digest the PCR receives (SHA256(data)). Authorization is a fresh policy
- * session satisfying PolicyAuthValue (HMAC proves the secret). One session per
- * extend keeps the (rolling) session nonce handling trivial.
+ * session satisfying PolicyAuthValue (HMAC proves the DUID-derived secret).
+ * One session per extend keeps the (rolling) session nonce handling trivial.
  */
-static int measure_nv_extend(struct udevice *dev, const void *data, u32 len)
+static int measure_nv_extend(struct udevice *dev, const void *fdt,
+			     const void *data, u32 len)
 {
 	struct tpm2_auth_session session;
+	u8 secret[TPM2_DIGEST_LEN];
 	u8 digest[TPM2_DIGEST_LEN];
 	u8 nv_name[68];
 	u32 nv_name_len = sizeof(nv_name);
 	sha256_context ctx;
 	u32 rc;
+
+	if (measure_factory_secret(fdt, secret)) {
+		printf("[MBOOT] no rpi-duid: cannot derive NV secret, skipping\n");
+		return -1;
+	}
 
 	sha256_starts(&ctx);
 	sha256_update(&ctx, data, len);
@@ -1040,8 +1071,7 @@ static int measure_nv_extend(struct udevice *dev, const void *data, u32 len)
 	if (!rc)
 		rc = tpm2_nv_extend(dev, CONFIG_MEASURE_NV_INDEX,
 				    nv_name, nv_name_len,
-				    measure_factory_secret,
-				    sizeof(measure_factory_secret) - 1,
+				    secret, TPM2_DIGEST_LEN,
 				    &session, digest, TPM2_DIGEST_LEN);
 	tpm2_flush_context(dev, session.handle);
 	if (rc)
@@ -1051,8 +1081,8 @@ static int measure_nv_extend(struct udevice *dev, const void *data, u32 len)
 	return rc;
 }
 #else
-static inline int measure_nv_extend(struct udevice *dev, const void *data,
-				    u32 len)
+static inline int measure_nv_extend(struct udevice *dev, const void *fdt,
+				    const void *data, u32 len)
 {
 	return 0;
 }
@@ -1133,7 +1163,7 @@ int bootm_measure(struct bootm_headers *images)
 
 		/* Also record the kernel measurement in the NV extend index */
 		printf("[MBOOT] bootm_measure: NV-extending kernel measurement\n");
-		measure_nv_extend(dev, image_buf, kernel_len);
+		measure_nv_extend(dev, images->ft_addr, image_buf, kernel_len);
 
 		rd_len = images->rd_end - images->rd_start;
 		printf("[MBOOT] bootm_measure: measuring initrd -> PCR 9 (rd_start=0x%lx, rd_len=0x%x)\n",
