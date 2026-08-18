@@ -827,6 +827,26 @@ if MEASURED_BOOT
 	  performed on the sanitized copy. The devicetree handed to the
 	  operating system is not modified.
 
+	config MEASURE_NV_EXTEND
+	bool "Also record measurements in a TPM NV extend index"
+	depends on TPM_V2
+	help
+	  In addition to extending PCRs, extend the boot measurements into a
+	  TPM_NT_EXTEND NV index whose write is gated by a PolicyAuthValue
+	  policy session (an HMAC proving a provisioned secret, never sent on
+	  the bus). Unlike PCRs, which anyone with bus access can extend, this
+	  restricts measurement recording to a holder of the secret, and the
+	  index persists across reboots (reset by clear_stclear). Used by the
+	  measured-boot design of this project.
+
+	config MEASURE_NV_INDEX
+	hex "NV extend index (offset, HR_NV_INDEX added internally)"
+	depends on MEASURE_NV_EXTEND
+	default 0x00c00000
+	help
+	  Offset of the NV extend index. The full handle is
+	  HR_NV_INDEX (0x01000000) + this value, e.g. 0x00c00000 -> 0x01c00000.
+
 	config MEASURE_IGNORE_LOG
 	bool "Ignore the existing event log"
 	default n

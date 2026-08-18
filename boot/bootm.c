@@ -25,6 +25,7 @@
 #include <asm/io.h>
 #include <linux/sizes.h>
 #include <tpm-v2.h>
+#include <u-boot/sha256.h>
 #if defined(CONFIG_CMD_USB)
 #include <usb.h>
 #endif
@@ -996,6 +997,67 @@ out:
 	return ret;
 }
 
+#if CONFIG_IS_ENABLED(MEASURE_NV_EXTEND)
+/*
+ * Factory secret authorizing the NV extend index. For now this is a fixed
+ * demo value compiled into the (secure-boot-signed) U-Boot binary; the design
+ * calls for deriving it from the SoC DUID / OTP so it is not carried on the SD
+ * card (see rp5_tpm_secure_boot/docs/hardening-and-secret-storage.md).
+ */
+static const u8 measure_factory_secret[] = "demo-factory-secret";
+
+/*
+ * Extend @len bytes at @data into the measured-boot NV extend index, using the
+ * same digest the PCR receives (SHA256(data)). Authorization is a fresh policy
+ * session satisfying PolicyAuthValue (HMAC proves the secret). One session per
+ * extend keeps the (rolling) session nonce handling trivial.
+ */
+static int measure_nv_extend(struct udevice *dev, const void *data, u32 len)
+{
+	struct tpm2_auth_session session;
+	u8 digest[TPM2_DIGEST_LEN];
+	u8 nv_name[68];
+	u32 nv_name_len = sizeof(nv_name);
+	sha256_context ctx;
+	u32 rc;
+
+	sha256_starts(&ctx);
+	sha256_update(&ctx, data, len);
+	sha256_finish(&ctx, digest);
+
+	rc = tpm2_nv_read_public(dev, CONFIG_MEASURE_NV_INDEX,
+				 nv_name, &nv_name_len);
+	if (rc) {
+		printf("[MBOOT] NV read_public failed 0x%x\n", rc);
+		return rc;
+	}
+	rc = tpm2_start_auth_session(dev, TPM_SE_POLICY, &session);
+	if (rc) {
+		printf("[MBOOT] NV start_auth_session failed 0x%x\n", rc);
+		return rc;
+	}
+	rc = tpm2_policy_auth_value(dev, &session);
+	if (!rc)
+		rc = tpm2_nv_extend(dev, CONFIG_MEASURE_NV_INDEX,
+				    nv_name, nv_name_len,
+				    measure_factory_secret,
+				    sizeof(measure_factory_secret) - 1,
+				    &session, digest, TPM2_DIGEST_LEN);
+	tpm2_flush_context(dev, session.handle);
+	if (rc)
+		printf("[MBOOT] NV extend failed 0x%x\n", rc);
+	else
+		printf("[MBOOT] NV extend OK (len=0x%x)\n", len);
+	return rc;
+}
+#else
+static inline int measure_nv_extend(struct udevice *dev, const void *data,
+				    u32 len)
+{
+	return 0;
+}
+#endif
+
 int bootm_measure(struct bootm_headers *images)
 {
 	int ret = 0;
@@ -1068,6 +1130,10 @@ int bootm_measure(struct bootm_headers *images)
 			printf("[MBOOT] bootm_measure: kernel measure FAILED ret=%d\n", ret);
 			goto unmap_image;
 		}
+
+		/* Also record the kernel measurement in the NV extend index */
+		printf("[MBOOT] bootm_measure: NV-extending kernel measurement\n");
+		measure_nv_extend(dev, image_buf, kernel_len);
 
 		rd_len = images->rd_end - images->rd_start;
 		printf("[MBOOT] bootm_measure: measuring initrd -> PCR 9 (rd_start=0x%lx, rd_len=0x%x)\n",
