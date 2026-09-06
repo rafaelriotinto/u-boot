@@ -1246,6 +1246,9 @@ static int measure_nv_extend(struct udevice *dev, const void *fdt)
 				    secret, TPM2_DIGEST_LEN,
 				    &session, digest, TPM2_DIGEST_LEN);
 	tpm2_flush_context(dev, session.handle);
+	/* The secret has served its one purpose; do not leave it on the stack. */
+	memset(secret, 0, sizeof(secret));
+	memset(&session, 0, sizeof(session));
 	if (rc)
 		printf("[MBOOT] NV extend failed 0x%x\n", rc);
 	else
@@ -1253,6 +1256,49 @@ static int measure_nv_extend(struct udevice *dev, const void *fdt)
 		       digest[0], digest[1], digest[2], digest[3]);
 	return rc;
 }
+
+#if CONFIG_IS_ENABLED(MEASURE_SCRUB_DUID)
+/*
+ * Remove the source of the board secret from the devicetree handed to the OS.
+ *
+ * The firmware exposes the SoC's device-unique identifier at /chosen/rpi-duid,
+ * and the NV index authValue is derived from it. U-Boot needs it exactly once,
+ * at boot, to prove that secret to the TPM through an HMAC session; nothing in
+ * the operating system needs it at all (attestation is secret-free -- the
+ * server drives an attested reboot instead). Left in place, the property is
+ * world-readable in Linux (/proc/device-tree/chosen/rpi-duid, mode 0444), so
+ * any local process could derive the authValue.
+ *
+ * Ordering: bootm_measure() runs before BOOTM_STATE_OS_PREP, and the FDT the
+ * kernel receives is relocated/fixed up during OS_PREP -- so deleting from the
+ * original blob here means the copy the kernel gets never contains it. The
+ * measurement is unaffected: the canonical digest was computed above, before
+ * this runs, from the unmodified tree.
+ *
+ * This closes the on-device path only. The DUID remains in OTP and in RAM
+ * while U-Boot runs; those are covered by secure boot (no foreign code runs)
+ * and by the physical-attack cost analysis in the threat model.
+ */
+static void measure_scrub_duid(void *fdt)
+{
+	int node, rc;
+
+	if (!fdt)
+		return;
+	node = fdt_path_offset(fdt, "/chosen");
+	if (node < 0)
+		return;
+	rc = fdt_delprop(fdt, node, "rpi-duid");
+	if (rc == -FDT_ERR_NOTFOUND)
+		return;
+	if (rc)
+		printf("[MBOOT] scrub: could not remove /chosen/rpi-duid (%d)\n", rc);
+	else
+		printf("[MBOOT] scrub: /chosen/rpi-duid removed from the OS devicetree\n");
+}
+#else
+static inline void measure_scrub_duid(void *fdt) { }
+#endif
 #else
 static inline int measure_nv_extend(struct udevice *dev, const void *fdt)
 {
@@ -1408,6 +1454,13 @@ unmap_image:
 	} else {
 		printf("[MBOOT] bootm_measure: CONFIG_MEASURED_BOOT not enabled\n");
 	}
+
+	/*
+	 * Always, regardless of ret: the kernel is booted either way (the
+	 * measurement result is not used to gate boot), so the secret's source
+	 * must never reach it.
+	 */
+	measure_scrub_duid(images->ft_addr);
 
 	printf("[MBOOT] bootm_measure: exit ret=%d\n", ret);
 	return ret;

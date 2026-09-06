@@ -847,6 +847,20 @@ if MEASURED_BOOT
 	  Offset of the NV extend index. The full handle is
 	  HR_NV_INDEX (0x01000000) + this value, e.g. 0x00c00000 -> 0x01c00000.
 
+	config MEASURE_SCRUB_DUID
+		bool "Remove /chosen/rpi-duid from the devicetree handed to the OS"
+		depends on MEASURE_NV_EXTEND
+		default y
+		help
+		  The NV index authValue is derived from the SoC device-unique
+		  identifier that the firmware exposes at /chosen/rpi-duid. U-Boot
+		  needs it once, at boot, to authorise the NV extend; nothing in the
+		  operating system needs it. Left in place it is world-readable in
+		  Linux (/proc/device-tree/chosen/rpi-duid), letting any local
+		  process derive the authValue. This deletes the property from the
+		  devicetree after the measurement and before the FDT is prepared
+		  for the kernel. The measurement itself is unaffected.
+
 	config MEASURE_IGNORE_LOG
 	bool "Ignore the existing event log"
 	default n
