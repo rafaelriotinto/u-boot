@@ -925,9 +925,9 @@ int bootm_process_cmdline_env(int flags)
 }
 
 /*
- * Content injected into the devicetree by the platform firmware that does
- * not describe the SOFTWARE being measured, and so must not be part of the
- * DTB measurement. Two classes:
+ * Content injected into the devicetree by the platform firmware that does not
+ * describe the SOFTWARE being measured, and so must not affect the digest.
+ * Two classes:
  *
  *   - boot-varying state: the random /chosen/kaslr-seed and /chosen/rng-seed,
  *     and the /chosen/bootloader node (reset reason 'rsts', reset counter
@@ -935,18 +935,19 @@ int bootm_process_cmdline_env(int flags)
  *
  *   - ENVIRONMENT state: /chosen/power holds the result of the USB Power
  *     Delivery negotiation (max_current, usbpd_power_data_objects,
- *     usb_max_current_enable, over-current flags). It describes the power
- *     supply, port and cable attached to the board -- not the software. It is
- *     renegotiated on a COLD power-up but not on a warm reboot, so the
- *     resulting instability is invisible to warm-reboot testing.
+ *     usb_max_current_enable, over-current flags, and on some supplies an
+ *     extra rpi_power_supply property that is absent on others). It describes
+ *     the power supply, port and cable attached to the board -- not the
+ *     software. It is renegotiated on a COLD power-up but not on a warm
+ *     reboot, so the instability it causes is invisible to warm-reboot
+ *     testing.
  *
- * Measured on Raspberry Pi 5 with an unchanged boot.img: PSU cold boot and
- * PSU warm reboot both gave PCR0 = F6361032..., while a cold boot powered
- * from a PC USB-C port gave 3B1136DE..., and returning to the PSU restored
- * F6361032... Leaving /chosen/power in the measurement therefore makes
- * attestation REJECT a perfectly healthy device whenever its power source
- * changes -- a false positive, which erodes trust in the mechanism faster
- * than a missed detection would.
+ * Measured on Raspberry Pi 5 with an unchanged boot.img: the same image gave
+ * one PCR0 on the 27 W supply and a different one powered from a PC USB-C
+ * port, reproducibly, and returning to the supply restored the original value.
+ * Leaving this in the measurement makes attestation REJECT a healthy device
+ * whenever its power source changes -- a false positive, which erodes trust in
+ * the mechanism faster than a missed detection would.
  *
  * General principle: a measurement should cover what is executing, not the
  * conditions it happens to be executing under. Any firmware-populated
@@ -963,61 +964,131 @@ static const char * const dtb_strip_nodes[] = {
 	"power",
 };
 
+static bool dtb_skip_chosen_prop(const char *name)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(dtb_strip_props); i++)
+		if (!strcmp(name, dtb_strip_props[i]))
+			return true;
+
+	return false;
+}
+
+static bool dtb_skip_chosen_node(const char *name)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(dtb_strip_nodes); i++)
+		if (!strcmp(name, dtb_strip_nodes[i]))
+			return true;
+
+	return false;
+}
+
 /*
- * Measure a sanitized copy of the devicetree into PCR 0: copy the blob,
- * delete the boot-varying properties/nodes listed above, repack (so that
- * neither the deleted bytes nor blob padding influence the digest), and
- * hash the result. The original devicetree handed to the OS is untouched.
+ * Hash a CANONICAL SERIALIZATION of the devicetree rather than the blob.
+ *
+ * The obvious implementation -- copy the blob, delete the excluded nodes and
+ * properties, fdt_pack() and hash the result -- does NOT work, and the reason
+ * is worth recording. fdt_del_node() splices only the STRUCTURE block, and
+ * fdt_pack() moves the blocks together while carrying the strings block over
+ * unchanged (it passes fdt_size_dt_strings() straight through). libfdt has no
+ * garbage collection for the string table, so the NAMES of deleted properties
+ * survive in the packed blob. On this platform one of them, rpi_power_supply,
+ * is present with one power supply and absent with another -- so the digest
+ * still tracked the power source even with the node deleted.
+ *
+ * Hashing a traversal instead makes the measurement independent of blob
+ * layout, padding, property ordering within the string table, and the presence
+ * of orphaned strings. For each node in depth-first order we absorb its name,
+ * then each property's name and value; excluded entries under /chosen are
+ * skipped entirely. Lengths are absorbed alongside the bytes so that
+ * concatenation cannot be ambiguous.
  */
+static int tcg2_dtb_canonical_digest(const void *fdt, u8 *out)
+{
+	int chosen, node, prop, depth;
+	sha256_context ctx;
+	__be32 be;
+
+	chosen = fdt_path_offset(fdt, "/chosen");
+
+	sha256_starts(&ctx);
+
+	for (node = 0, depth = 0;
+	     node >= 0;
+	     node = fdt_next_node(fdt, node, &depth)) {
+		const char *nname = fdt_get_name(fdt, node, NULL);
+		bool in_chosen;
+
+		if (!nname)
+			return -1;
+
+		/* Skip whole excluded subtrees directly under /chosen. */
+		if (chosen >= 0 && fdt_parent_offset(fdt, node) == chosen &&
+		    dtb_skip_chosen_node(nname))
+			continue;
+
+		in_chosen = (node == chosen);
+
+		be = cpu_to_be32(strlen(nname));
+		sha256_update(&ctx, (const u8 *)&be, sizeof(be));
+		sha256_update(&ctx, (const u8 *)nname, strlen(nname));
+
+		for (prop = fdt_first_property_offset(fdt, node);
+		     prop >= 0;
+		     prop = fdt_next_property_offset(fdt, prop)) {
+			const char *pname;
+			const void *val;
+			int len;
+
+			val = fdt_getprop_by_offset(fdt, prop, &pname, &len);
+			if (!val || len < 0)
+				return -1;
+
+			if (in_chosen && dtb_skip_chosen_prop(pname))
+				continue;
+
+			be = cpu_to_be32(strlen(pname));
+			sha256_update(&ctx, (const u8 *)&be, sizeof(be));
+			sha256_update(&ctx, (const u8 *)pname, strlen(pname));
+
+			be = cpu_to_be32(len);
+			sha256_update(&ctx, (const u8 *)&be, sizeof(be));
+			sha256_update(&ctx, (const u8 *)val, len);
+		}
+	}
+
+	sha256_finish(&ctx, out);
+
+	return 0;
+}
+
 static int tcg2_measure_dtb_sanitized(struct udevice *dev,
 				      struct tcg2_event_log *elog,
 				      void *fdt, u32 fdt_len)
 {
-	void *buf;
-	int nodeoff;
-	int err;
-	int i;
-	int ret;
+	u8 digest[TPM2_DIGEST_LEN];
 
-	buf = malloc(fdt_len + SZ_4K);
-	if (!buf)
-		return -ENOMEM;
-
-	err = fdt_open_into(fdt, buf, fdt_len + SZ_4K);
-	if (err) {
-		printf("[MBOOT] dtb_sanitize: fdt_open_into failed (%d)\n",
-		       err);
-		ret = -EINVAL;
-		goto out;
+	if (tcg2_dtb_canonical_digest(fdt, digest)) {
+		printf("[MBOOT] dtb_sanitize: canonical digest FAILED\n");
+		return -EINVAL;
 	}
 
-	nodeoff = fdt_path_offset(buf, "/chosen");
-	if (nodeoff >= 0) {
-		for (i = 0; i < ARRAY_SIZE(dtb_strip_props); i++) {
-			err = fdt_delprop(buf, nodeoff, dtb_strip_props[i]);
-			if (err && err != -FDT_ERR_NOTFOUND)
-				printf("[MBOOT] dtb_sanitize: delprop %s failed (%d)\n",
-				       dtb_strip_props[i], err);
-		}
-		for (i = 0; i < ARRAY_SIZE(dtb_strip_nodes); i++) {
-			int sub = fdt_subnode_offset(buf, nodeoff,
-						     dtb_strip_nodes[i]);
-			if (sub >= 0)
-				fdt_del_node(buf, sub);
-		}
-	}
+	printf("[MBOOT] dtb_sanitize: canonical DTB digest %02x%02x%02x%02x... -> PCR 0\n",
+	       digest[0], digest[1], digest[2], digest[3]);
 
-	fdt_pack(buf);
-
-	printf("[MBOOT] dtb_sanitize: measuring sanitized DTB -> PCR 0 (len 0x%x -> 0x%x)\n",
-	       fdt_len, fdt_totalsize(buf));
-
-	ret = tcg2_measure_data(dev, elog, 0, fdt_totalsize(buf), buf,
-				EV_TABLE_OF_DEVICES, strlen("dts") + 1,
-				(u8 *)"dts");
-out:
-	free(buf);
-	return ret;
+	/*
+	 * Measure the canonical digest itself, so PCR0 ends up as
+	 * extend(SHA256(canonical_digest)). There is no blob whose hash equals
+	 * the canonical value -- it is a hash over a traversal, not over
+	 * contiguous bytes -- so the digest is what gets fed in. The event log
+	 * entry stays "dts", as before.
+	 */
+	return tcg2_measure_data(dev, elog, 0, TPM2_DIGEST_LEN, digest,
+				 EV_TABLE_OF_DEVICES, strlen("dts") + 1,
+				 (u8 *)"dts");
 }
 
 #if CONFIG_IS_ENABLED(MEASURE_NV_EXTEND)
