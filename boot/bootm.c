@@ -1016,19 +1016,37 @@ static int tcg2_dtb_canonical_digest(const void *fdt, u8 *out)
 
 	sha256_starts(&ctx);
 
-	for (node = 0, depth = 0;
-	     node >= 0;
-	     node = fdt_next_node(fdt, node, &depth)) {
+	/*
+	 * fdt_next_node() gotcha: when the ROOT node closes, depth goes to -1
+	 * and the function returns a POSITIVE offset (that of the FDT_END tag),
+	 * not a node. A loop that checks only "node >= 0" then calls
+	 * fdt_get_name() on the END tag, gets NULL, and fails. The end-of-tree
+	 * condition is "depth < 0", and it must be checked as well.
+	 */
+	node = 0;
+	depth = 0;
+	while (node >= 0 && depth >= 0) {
 		const char *nname = fdt_get_name(fdt, node, NULL);
 		bool in_chosen;
 
 		if (!nname)
 			return -1;
 
-		/* Skip whole excluded subtrees directly under /chosen. */
+		/*
+		 * Skip an excluded node AND its whole subtree: advance until
+		 * we are back at (or above) this node's depth. A plain
+		 * "continue" would only skip the node's own properties and
+		 * then descend into its children.
+		 */
 		if (chosen >= 0 && fdt_parent_offset(fdt, node) == chosen &&
-		    dtb_skip_chosen_node(nname))
+		    dtb_skip_chosen_node(nname)) {
+			int skip_depth = depth;
+
+			do {
+				node = fdt_next_node(fdt, node, &depth);
+			} while (node >= 0 && depth > skip_depth);
 			continue;
+		}
 
 		in_chosen = (node == chosen);
 
@@ -1058,6 +1076,8 @@ static int tcg2_dtb_canonical_digest(const void *fdt, u8 *out)
 			sha256_update(&ctx, (const u8 *)&be, sizeof(be));
 			sha256_update(&ctx, (const u8 *)val, len);
 		}
+
+		node = fdt_next_node(fdt, node, &depth);
 	}
 
 	sha256_finish(&ctx, out);
