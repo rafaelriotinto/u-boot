@@ -11,6 +11,7 @@
 #include <cli.h>
 #include <command.h>
 #include <cpu_func.h>
+#include <dm.h>
 #include <env.h>
 #include <errno.h>
 #include <fdt_support.h>
@@ -1085,15 +1086,27 @@ static const u8 nv_commit_pcrs[] = { 0, 1, 8, 9 };
  */
 static int measure_nv_compose(struct udevice *dev, u8 *out)
 {
+	struct tpm_chip_priv *priv = dev_get_uclass_priv(dev);
 	u8 pcr[TPM2_DIGEST_LEN];
 	unsigned int updates;
 	sha256_context ctx;
 	u32 rc;
 	int i;
 
+	if (!priv)
+		return -1;
+
 	sha256_starts(&ctx);
 	for (i = 0; i < ARRAY_SIZE(nv_commit_pcrs); i++) {
-		rc = tpm2_pcr_read(dev, nv_commit_pcrs[i], 24, TPM2_ALG_SHA256,
+		/*
+		 * pcr_select_min is the chip's minimum pcrSelect array size in
+		 * BYTES (typically 3, i.e. PCRs 0..23). Passing a fixed number
+		 * here would build a malformed TPML_PCR_SELECTION and the TPM
+		 * would reject the command, so take it from the device as the
+		 * other callers of tpm2_pcr_read() do.
+		 */
+		rc = tpm2_pcr_read(dev, nv_commit_pcrs[i], priv->pcr_select_min,
+				   TPM2_ALG_SHA256,
 				   pcr, TPM2_DIGEST_LEN, &updates);
 		if (rc) {
 			printf("[MBOOT] NV commit: PCR %u read failed 0x%x\n",
