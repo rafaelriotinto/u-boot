@@ -1287,17 +1287,6 @@ int bootm_measure(struct bootm_headers *images)
 		if (ret)
 			printf("[MBOOT] bootm_measure: bootargs measure FAILED ret=%d\n", ret);
 
-		/*
-		 * LAST: commit the whole measured state to the DUID-protected
-		 * NV index. This must run after every PCR above is final --
-		 * it reads them back and extends the index with their
-		 * composite. Only a bootloader able to derive the DUID secret
-		 * can perform this write, which is what binds the evidence to
-		 * the genuine board.
-		 */
-		printf("[MBOOT] bootm_measure: NV-committing PCR composite\n");
-		measure_nv_extend(dev, images->ft_addr);
-
 unmap_initrd:
 		unmap_sysmem(initrd_buf);
 
@@ -1305,6 +1294,25 @@ unmap_image:
 		unmap_sysmem(image_buf);
 		printf("[MBOOT] bootm_measure: calling measurement_term (error=%d)\n", ret != 0);
 		tcg2_measurement_term(dev, &elog, ret != 0);
+
+		/*
+		 * LAST, and deliberately AFTER tcg2_measurement_term(): that
+		 * call extends EV_SEPARATOR into PCRs 0-7, so PCR0 and PCR1
+		 * change here. The verifier compares this commitment against a
+		 * QUOTE taken from the running system, which necessarily sees
+		 * the post-separator values -- so the commitment must be taken
+		 * at the same point, or the two describe different states and
+		 * can never agree.
+		 *
+		 * Skipped on the error path: there is nothing worth committing
+		 * to if a measurement failed, and leaving the index unwritten
+		 * makes attestation fail closed.
+		 */
+		if (!ret) {
+			printf("[MBOOT] bootm_measure: NV-committing PCR composite\n");
+			measure_nv_extend(dev, images->ft_addr);
+		}
+
 		free(elog.log);
 	} else {
 		printf("[MBOOT] bootm_measure: CONFIG_MEASURED_BOOT not enabled\n");
