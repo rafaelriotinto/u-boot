@@ -924,12 +924,33 @@ int bootm_process_cmdline_env(int flags)
 }
 
 /*
- * Boot-varying content injected into the devicetree by the platform
- * firmware, which must not be part of the DTB measurement. Verified on
- * Raspberry Pi 5 (cold vs. warm boot device tree diff): the random
- * /chosen/kaslr-seed and /chosen/rng-seed, and the /chosen/bootloader
- * node (reset reason 'rsts' and reset counter 'count') are the only
- * properties that change between boots.
+ * Content injected into the devicetree by the platform firmware that does
+ * not describe the SOFTWARE being measured, and so must not be part of the
+ * DTB measurement. Two classes:
+ *
+ *   - boot-varying state: the random /chosen/kaslr-seed and /chosen/rng-seed,
+ *     and the /chosen/bootloader node (reset reason 'rsts', reset counter
+ *     'count'). These differ between any two boots.
+ *
+ *   - ENVIRONMENT state: /chosen/power holds the result of the USB Power
+ *     Delivery negotiation (max_current, usbpd_power_data_objects,
+ *     usb_max_current_enable, over-current flags). It describes the power
+ *     supply, port and cable attached to the board -- not the software. It is
+ *     renegotiated on a COLD power-up but not on a warm reboot, so the
+ *     resulting instability is invisible to warm-reboot testing.
+ *
+ * Measured on Raspberry Pi 5 with an unchanged boot.img: PSU cold boot and
+ * PSU warm reboot both gave PCR0 = F6361032..., while a cold boot powered
+ * from a PC USB-C port gave 3B1136DE..., and returning to the PSU restored
+ * F6361032... Leaving /chosen/power in the measurement therefore makes
+ * attestation REJECT a perfectly healthy device whenever its power source
+ * changes -- a false positive, which erodes trust in the mechanism faster
+ * than a missed detection would.
+ *
+ * General principle: a measurement should cover what is executing, not the
+ * conditions it happens to be executing under. Any firmware-populated
+ * devicetree should be audited for runtime-recorded values (power, thermal,
+ * clock, link state) before it is measured.
  */
 static const char * const dtb_strip_props[] = {
 	"kaslr-seed",
@@ -938,6 +959,7 @@ static const char * const dtb_strip_props[] = {
 
 static const char * const dtb_strip_nodes[] = {
 	"bootloader",
+	"power",
 };
 
 /*
@@ -1036,15 +1058,62 @@ static int measure_factory_secret(const void *fdt, u8 secret[TPM2_DIGEST_LEN])
  * session satisfying PolicyAuthValue (HMAC proves the DUID-derived secret).
  * One session per extend keeps the (rolling) session nonce handling trivial.
  */
-static int measure_nv_extend(struct udevice *dev, const void *fdt,
-			     const void *data, u32 len)
+/*
+ * PCRs the NV index commits to. MUST match the set the attestation server
+ * quotes, and MUST be in ascending order, because the digest below is
+ * composed the same way the TPM composes a quote's pcrDigest -- which lets
+ * the verifier additionally check
+ *     NV value == SHA256(0x00 * 32 || quote.pcrDigest)
+ * and so bind "these measurements" to "a board holding the DUID secret".
+ * If this set ever changes, the verifier must change with it: divergence
+ * would silently weaken the check rather than fail visibly.
+ */
+static const u8 nv_commit_pcrs[] = { 0, 1, 8, 9 };
+
+/*
+ * Compose the digest the NV index commits to: SHA256 over the concatenated
+ * current values of nv_commit_pcrs, i.e. the same composite a quote reports.
+ *
+ * Committing to the PCR set rather than to the kernel alone is what makes
+ * board binding cover the whole measured state. The kernel was previously the
+ * only component recorded here; the devicetree, kernel command line and
+ * initrd lived only in ordinary PCRs, which an attacker on a substituted
+ * board can reproduce -- their inputs are public and extending is
+ * deterministic. Widening the commitment costs nothing in confidentiality,
+ * because the protection is the authority to WRITE the index, not the secrecy
+ * of its contents.
+ */
+static int measure_nv_compose(struct udevice *dev, u8 *out)
+{
+	u8 pcr[TPM2_DIGEST_LEN];
+	unsigned int updates;
+	sha256_context ctx;
+	u32 rc;
+	int i;
+
+	sha256_starts(&ctx);
+	for (i = 0; i < ARRAY_SIZE(nv_commit_pcrs); i++) {
+		rc = tpm2_pcr_read(dev, nv_commit_pcrs[i], 24, TPM2_ALG_SHA256,
+				   pcr, TPM2_DIGEST_LEN, &updates);
+		if (rc) {
+			printf("[MBOOT] NV commit: PCR %u read failed 0x%x\n",
+			       nv_commit_pcrs[i], rc);
+			return -1;
+		}
+		sha256_update(&ctx, pcr, TPM2_DIGEST_LEN);
+	}
+	sha256_finish(&ctx, out);
+
+	return 0;
+}
+
+static int measure_nv_extend(struct udevice *dev, const void *fdt)
 {
 	struct tpm2_auth_session session;
 	u8 secret[TPM2_DIGEST_LEN];
 	u8 digest[TPM2_DIGEST_LEN];
 	u8 nv_name[68];
 	u32 nv_name_len = sizeof(nv_name);
-	sha256_context ctx;
 	u32 rc;
 
 	if (measure_factory_secret(fdt, secret)) {
@@ -1052,9 +1121,8 @@ static int measure_nv_extend(struct udevice *dev, const void *fdt,
 		return -1;
 	}
 
-	sha256_starts(&ctx);
-	sha256_update(&ctx, data, len);
-	sha256_finish(&ctx, digest);
+	if (measure_nv_compose(dev, digest))
+		return -1;
 
 	rc = tpm2_nv_read_public(dev, CONFIG_MEASURE_NV_INDEX,
 				 nv_name, &nv_name_len);
@@ -1077,12 +1145,12 @@ static int measure_nv_extend(struct udevice *dev, const void *fdt,
 	if (rc)
 		printf("[MBOOT] NV extend failed 0x%x\n", rc);
 	else
-		printf("[MBOOT] NV extend OK (len=0x%x)\n", len);
+		printf("[MBOOT] NV commit OK (PCR composite %02x%02x%02x%02x...)\n",
+		       digest[0], digest[1], digest[2], digest[3]);
 	return rc;
 }
 #else
-static inline int measure_nv_extend(struct udevice *dev, const void *fdt,
-				    const void *data, u32 len)
+static inline int measure_nv_extend(struct udevice *dev, const void *fdt)
 {
 	return 0;
 }
@@ -1161,10 +1229,6 @@ int bootm_measure(struct bootm_headers *images)
 			goto unmap_image;
 		}
 
-		/* Also record the kernel measurement in the NV extend index */
-		printf("[MBOOT] bootm_measure: NV-extending kernel measurement\n");
-		measure_nv_extend(dev, images->ft_addr, image_buf, kernel_len);
-
 		rd_len = images->rd_end - images->rd_start;
 		printf("[MBOOT] bootm_measure: measuring initrd -> PCR 9 (rd_start=0x%lx, rd_len=0x%x)\n",
 		       images->rd_start, rd_len);
@@ -1209,6 +1273,17 @@ int bootm_measure(struct bootm_headers *images)
 					strlen(s) + 1, (u8 *)s);
 		if (ret)
 			printf("[MBOOT] bootm_measure: bootargs measure FAILED ret=%d\n", ret);
+
+		/*
+		 * LAST: commit the whole measured state to the DUID-protected
+		 * NV index. This must run after every PCR above is final --
+		 * it reads them back and extends the index with their
+		 * composite. Only a bootloader able to derive the DUID secret
+		 * can perform this write, which is what binds the evidence to
+		 * the genuine board.
+		 */
+		printf("[MBOOT] bootm_measure: NV-committing PCR composite\n");
+		measure_nv_extend(dev, images->ft_addr);
 
 unmap_initrd:
 		unmap_sysmem(initrd_buf);
