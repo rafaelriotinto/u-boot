@@ -1413,11 +1413,31 @@ int bootm_measure(struct bootm_headers *images)
 			printf("[MBOOT] bootm_measure: CONFIG_MEASURE_DEVICETREE not enabled, skipping DTB\n");
 		}
 
-		s = env_get("bootargs");
+		/*
+		 * Measure the command line the kernel will ACTUALLY receive, not
+		 * merely U-Boot's "bootargs" variable. fdt_chosen() writes
+		 * board_fdt_chosen_bootargs() -- by default env "bootargs" -- into
+		 * /chosen/bootargs only if it is non-NULL; otherwise the value the
+		 * firmware placed there (cmdline.txt plus its own additions) is left
+		 * as is and that is what boots. On this board the environment is
+		 * "nowhere" and bootargs is unset, so the previous code measured an
+		 * EMPTY string into PCR 1 on every boot: PCR 1 was a constant that
+		 * covered nothing, while the kernel command line -- which now
+		 * carries the dm-verity root hash -- went unmeasured. Found by
+		 * arithmetic: PCR1 == extend(extend(0, SHA256("\0")), separator).
+		 */
+		s = board_fdt_chosen_bootargs();
+		if (!s && images->ft_addr) {
+			int chosen = fdt_path_offset(images->ft_addr, "/chosen");
+
+			if (chosen >= 0)
+				s = fdt_getprop(images->ft_addr, chosen, "bootargs",
+						NULL);
+		}
 		if (!s)
 			s = "";
-		printf("[MBOOT] bootm_measure: measuring bootargs -> PCR 1 (len=%zu)\n",
-		       strlen(s));
+		printf("[MBOOT] bootm_measure: measuring kernel cmdline -> PCR 1 (len=%zu, source=%s)\n",
+		       strlen(s), board_fdt_chosen_bootargs() ? "env" : "firmware DT");
 		ret = tcg2_measure_data(dev, &elog, 1, strlen(s) + 1, (u8 *)s,
 					EV_PLATFORM_CONFIG_FLAGS,
 					strlen(s) + 1, (u8 *)s);
