@@ -714,6 +714,31 @@ too_long:
 	return NULL;
 }
 
+/*
+ * Publish the partition the firmware booted from as ${rpi_bootpart}, so the
+ * boot command re-reads boot.img (to extract the kernel) from the SAME
+ * partition whose boot.img the firmware verified and ran U-Boot from. A
+ * fixed "mmc 0:1" would pair slot B's U-Boot with slot A's kernel after an
+ * update. Left unset when the firmware did not report it: the boot command
+ * then fails closed instead of guessing.
+ */
+static void rpi_export_boot_partition(void)
+{
+	const void *fdt = (const void *)fw_dtb_pointer;
+	const u32 *part;
+	int node, len;
+	char buf[12];
+
+	if (fdt_magic(fdt) != FDT_MAGIC)
+		return;
+	node = fdt_path_offset(fdt, "/chosen/bootloader");
+	part = node >= 0 ? fdt_getprop(fdt, node, "partition", &len) : NULL;
+	if (!part || len != sizeof(u32))
+		return;
+	snprintf(buf, sizeof(buf), "%u", fdt32_to_cpu(*part));
+	env_set("rpi_bootpart", buf);
+}
+
 int board_late_init(void)
 {
 	struct udevice *dev;
@@ -723,6 +748,8 @@ int board_late_init(void)
 				 0, &dev);
 	if (err)
 		printf("RPI: RP1 device not found\n");
+
+	rpi_export_boot_partition();
 
 	return 0;
 }
