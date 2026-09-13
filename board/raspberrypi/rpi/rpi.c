@@ -11,6 +11,7 @@
 #include <fdt_support.h>
 #include <fdt_simplefb.h>
 #include <hang.h>
+#include <rp5_measure.h>
 #include <init.h>
 #include <memalign.h>
 #include <mmc.h>
@@ -577,6 +578,20 @@ void  update_fdt_from_fw(void *fdt, void *fw_fdt)
 
 int ft_board_setup(void *blob, struct bd_info *bd)
 {
+	/*
+	 * Export the canonical devicetree digest measured into PCR 0, so the
+	 * attestation service can report it and the server can enrol it once
+	 * per board (bootm.c: rp5_dt_digest). Done here, after the tree was
+	 * relocated with padding, because the firmware's blob has no room.
+	 */
+	if (rp5_dt_digest_valid) {
+		int chosen = fdt_path_offset(blob, "/chosen");
+
+		if (chosen >= 0 &&
+		    fdt_setprop(blob, chosen, "rp5,dt-digest", rp5_dt_digest,
+				sizeof(rp5_dt_digest)))
+			printf("[MBOOT] could not export rp5,dt-digest\n");
+	}
 	int node;
 
 	update_fdt_from_fw(blob, (void *)fw_dtb_pointer);

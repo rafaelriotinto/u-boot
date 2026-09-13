@@ -959,7 +959,24 @@ int bootm_process_cmdline_env(int flags)
 static const char * const dtb_strip_props[] = {
 	"kaslr-seed",
 	"rng-seed",
+	/*
+	 * The kernel command line is measured on its own into PCR 1 (bootm
+	 * measures /chosen/bootargs). Leaving it out of the devicetree digest
+	 * makes that digest a per-BOARD constant across releases (it still
+	 * carries the serial, revision and DUID the firmware wrote), so PCR0
+	 * can be predicted on the host from the release's version string and
+	 * a value enrolled once per board. See rp5_dt_digest below.
+	 */
+	"bootargs",
 };
+
+/*
+ * The canonical devicetree digest of this boot, exported to the OS as
+ * /chosen/rp5,dt-digest by the board's ft_board_setup(). Informational: the
+ * verifier predicts PCR0 from the enrolled value; the TPM quote is the truth.
+ */
+u8 rp5_dt_digest[TPM2_DIGEST_LEN];
+bool rp5_dt_digest_valid;
 
 static const char * const dtb_strip_nodes[] = {
 	"bootloader",
@@ -1100,6 +1117,8 @@ static int tcg2_measure_dtb_sanitized(struct udevice *dev,
 
 	printf("[MBOOT] dtb_sanitize: canonical DTB digest %02x%02x%02x%02x... -> PCR 0\n",
 	       digest[0], digest[1], digest[2], digest[3]);
+	memcpy(rp5_dt_digest, digest, sizeof(rp5_dt_digest));
+	rp5_dt_digest_valid = true;
 
 	/*
 	 * Measure the canonical digest itself, so PCR0 ends up as
