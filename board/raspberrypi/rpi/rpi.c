@@ -10,6 +10,7 @@
 #include <efi_loader.h>
 #include <fdt_support.h>
 #include <fdt_simplefb.h>
+#include <hang.h>
 #include <init.h>
 #include <memalign.h>
 #include <mmc.h>
@@ -604,6 +605,110 @@ int ft_board_setup(void *blob, struct bd_info *bd)
  * This initialization should be done only for RPI5 board.
  */
 #ifdef CONFIG_BCM2712
+/*
+ * A/B root selection: pair the root slot with the boot partition.
+ *
+ * With dm-verity the kernel command line names the root DEVICE (inside
+ * dm-mod.create=...), and the command line lives in cmdline.txt inside the
+ * SIGNED boot.img. Naming the partition there would force one signed image per
+ * slot. Instead cmdline.txt carries a placeholder, @ROOTDEV@, and the pairing
+ * is a fixed rule applied here at boot:
+ *
+ *     firmware loaded boot.img from partition 1  ->  root A
+ *     firmware loaded boot.img from partition 5  ->  root B
+ *
+ * The firmware reports the partition it booted from in the device tree, at
+ * /chosen/bootloader/partition. So ONE signed boot.img serves both pairs, an
+ * update always writes the pair that is not running, and a failed tryboot
+ * reverts to the untouched pair with nothing to swap back. The rule itself is
+ * signed (it is this code); the partition number is the only runtime input,
+ * and it can only choose between two roots that are each checked against the
+ * single root hash the image carries.
+ *
+ * This is board_fdt_chosen_bootargs(), which fdt_chosen() writes into the
+ * kernel's /chosen/bootargs and which bootm_measure() measures into PCR 1 --
+ * so the SUBSTITUTED command line is what gets measured.
+ *
+ * Fail closed: an unknown partition number, or a template with an unresolved
+ * placeholder, hangs rather than booting a root the rule does not vouch for.
+ * A template without the placeholder is passed through unchanged (dev images).
+ * An explicit "bootargs" environment variable keeps U-Boot's usual precedence.
+ */
+#define RPI_ROOTDEV_PLACEHOLDER	"@ROOTDEV@"
+
+static const struct {
+	u32 boot_partition;
+	const char *root_dev;
+} rpi_ab_pairs[] = {
+	{ 1, "/dev/mmcblk0p2" },	/* boot A -> root A */
+	{ 5, "/dev/mmcblk0p3" },	/* boot B -> root B */
+};
+
+char *board_fdt_chosen_bootargs(void)
+{
+	static char buf[2048];
+	const void *fdt = (const void *)fw_dtb_pointer;
+	const char *tmpl, *dev = NULL, *src, *hit;
+	const u32 *part;
+	int node, len, i;
+	size_t out = 0, ph = strlen(RPI_ROOTDEV_PLACEHOLDER);
+
+	/* explicit env wins, as everywhere in U-Boot */
+	tmpl = env_get("bootargs");
+	if (!tmpl) {
+		if (fdt_magic(fdt) != FDT_MAGIC)
+			return NULL;
+		node = fdt_path_offset(fdt, "/chosen");
+		if (node < 0)
+			return NULL;
+		tmpl = fdt_getprop(fdt, node, "bootargs", NULL);
+		if (!tmpl)
+			return NULL;
+	}
+
+	if (!strstr(tmpl, RPI_ROOTDEV_PLACEHOLDER))
+		return (char *)tmpl;		/* nothing to resolve */
+
+	node = fdt_path_offset(fdt, "/chosen/bootloader");
+	part = node >= 0 ? fdt_getprop(fdt, node, "partition", &len) : NULL;
+	if (part && len == sizeof(u32)) {
+		u32 p = fdt32_to_cpu(*part);
+
+		for (i = 0; i < ARRAY_SIZE(rpi_ab_pairs); i++)
+			if (rpi_ab_pairs[i].boot_partition == p)
+				dev = rpi_ab_pairs[i].root_dev;
+		printf("[AB] firmware booted from partition %u -> root %s\n",
+		       p, dev ? dev : "UNKNOWN");
+	} else {
+		printf("[AB] /chosen/bootloader/partition missing\n");
+	}
+	if (!dev) {
+		printf("[AB] cannot pair a root with this boot partition; halting\n");
+		hang();
+	}
+
+	/* substitute every occurrence of the placeholder */
+	for (src = tmpl; (hit = strstr(src, RPI_ROOTDEV_PLACEHOLDER)); src = hit + ph) {
+		size_t n = hit - src;
+
+		if (out + n + strlen(dev) >= sizeof(buf))
+			goto too_long;
+		memcpy(buf + out, src, n);
+		out += n;
+		memcpy(buf + out, dev, strlen(dev));
+		out += strlen(dev);
+	}
+	if (out + strlen(src) >= sizeof(buf))
+		goto too_long;
+	strcpy(buf + out, src);
+	return buf;
+
+too_long:
+	printf("[AB] command line too long after substitution; halting\n");
+	hang();
+	return NULL;
+}
+
 int board_late_init(void)
 {
 	struct udevice *dev;
