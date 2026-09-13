@@ -13,6 +13,7 @@
 #include <cpu_func.h>
 #include <dm.h>
 #include <hang.h>
+#include <linux/delay.h>
 #include <env.h>
 #include <errno.h>
 #include <fdt_support.h>
@@ -1283,8 +1284,19 @@ static int measure_nv_extend(struct udevice *dev, const void *fdt)
  * session proving SHA256("rp5-nv-counter-v1" || DUID), so only a U-Boot that
  * can derive the board secret advances the counter: nobody can burn versions
  * to brick the board, and a lifted TPM cannot be bumped elsewhere.
- * Fail closed: a missing or unreadable counter, or any TPM error, halts.
+ * Fail closed: a missing or unreadable counter, a rollback, or any TPM error
+ * RESETS the board rather than hanging: on a tryboot the firmware then falls
+ * back to the committed pair by itself (the one-shot flag was consumed), and
+ * on a committed pair a reset loop denies the old release just as a halt
+ * would, without needing someone to power-cycle a remote device.
  */
+static void antirollback_refuse(const char *why)
+{
+	printf("[ARB] %s -- refusing to boot this release; resetting\n", why);
+	mdelay(500);
+	do_reset(NULL, 0, 0, NULL);
+	hang();
+}
 static bool antirollback_tryboot(const void *fdt)
 {
 	const u32 *p;
@@ -1308,16 +1320,15 @@ static void antirollback_check(struct udevice *dev, const void *fdt)
 
 	rc = tpm2_nv_read_value(dev, CONFIG_ANTIROLLBACK_NV_INDEX, raw, sizeof(raw));
 	if (rc) {
-		printf("[ARB] counter read failed 0x%x -- no anti-rollback state; halting\n", rc);
-		hang();
+		printf("[ARB] counter read failed 0x%x\n", rc);
+		antirollback_refuse("no anti-rollback counter");
 	}
 	counter = get_unaligned_be64(raw);
 	printf("[ARB] this release: version %llu; board counter: %llu%s\n",
 	       version, counter, antirollback_tryboot(fdt) ? " (tryboot)" : "");
 
 	if (version < counter) {
-		printf("[ARB] ROLLBACK: this release is older than one already committed; halting\n");
-		hang();
+		antirollback_refuse("ROLLBACK: older than a release already committed here");
 	}
 	if (version == counter)
 		return;
@@ -1327,8 +1338,7 @@ static void antirollback_check(struct udevice *dev, const void *fdt)
 	}
 
 	if (measure_derive_secret(fdt, ANTIROLLBACK_AUTH_CTX, secret)) {
-		printf("[ARB] no rpi-duid: cannot authorise the counter; halting\n");
-		hang();
+		antirollback_refuse("no rpi-duid: cannot authorise the counter");
 	}
 	rc = tpm2_nv_read_public(dev, CONFIG_ANTIROLLBACK_NV_INDEX,
 				 nv_name, &nv_name_len);
@@ -1345,14 +1355,14 @@ static void antirollback_check(struct udevice *dev, const void *fdt)
 	memset(secret, 0, sizeof(secret));
 	memset(&session, 0, sizeof(session));
 	if (rc) {
-		printf("[ARB] counter increment failed 0x%x; halting\n", rc);
-		hang();
+		printf("[ARB] counter increment failed 0x%x\n", rc);
+		antirollback_refuse("counter increment failed");
 	}
 	/* read back: the counter is the truth, not our loop */
 	rc = tpm2_nv_read_value(dev, CONFIG_ANTIROLLBACK_NV_INDEX, raw, sizeof(raw));
 	if (rc || get_unaligned_be64(raw) != version) {
-		printf("[ARB] counter did not reach %llu; halting\n", version);
-		hang();
+		printf("[ARB] counter did not reach %llu\n", version);
+		antirollback_refuse("counter not advanced");
 	}
 	printf("[ARB] counter advanced to %llu (committed)\n", version);
 }
