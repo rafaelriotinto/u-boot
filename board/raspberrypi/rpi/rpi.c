@@ -614,11 +614,16 @@ int ft_board_setup(void *blob, struct bd_info *bd)
  * slot. Instead cmdline.txt carries a placeholder, @ROOTDEV@, and the pairing
  * is a fixed rule applied here at boot:
  *
- *     firmware loaded boot.img from partition 1  ->  root A
- *     firmware loaded boot.img from partition 5  ->  root B
+ *     firmware loaded boot.img from partition 1  ->  root A (p3)
+ *     firmware loaded boot.img from partition 2  ->  root B (p4)
  *
  * The firmware reports the partition it booted from in the device tree, at
- * /chosen/bootloader/partition. So ONE signed boot.img serves both pairs, an
+ * /chosen/bootloader/partition. On GPT that number is NOT the GPT slot: the
+ * firmware counts only partitions typed "Microsoft basic data" (the FAT boot
+ * partitions), so the layout keeps the two boot partitions first (p1, p2) and
+ * types the root slots as Linux filesystem, which makes both numberings agree
+ * (measured on the 2026-05 firmware; see experimental-results.md E13).
+ * So ONE signed boot.img serves both pairs, an
  * update always writes the pair that is not running, and a failed tryboot
  * reverts to the untouched pair with nothing to swap back. The rule itself is
  * signed (it is this code); the partition number is the only runtime input,
@@ -640,8 +645,8 @@ static const struct {
 	u32 boot_partition;
 	const char *root_dev;
 } rpi_ab_pairs[] = {
-	{ 1, "/dev/mmcblk0p2" },	/* boot A -> root A */
-	{ 5, "/dev/mmcblk0p3" },	/* boot B -> root B */
+	{ 1, "/dev/mmcblk0p3" },	/* boot A (p1) -> root A (p3) */
+	{ 2, "/dev/mmcblk0p4" },	/* boot B (p2) -> root B (p4) */
 };
 
 char *board_fdt_chosen_bootargs(void)
