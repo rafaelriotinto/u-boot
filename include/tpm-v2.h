@@ -349,6 +349,7 @@ enum tpm2_command_codes {
 	TPM2_CC_HIERCHANGEAUTH	= 0x0129,
 	TPM2_CC_NV_DEFINE_SPACE	= 0x012a,
 	TPM2_CC_PCR_SETAUTHPOL	= 0x012C,
+	TPM2_CC_NV_INCREMENT	= 0x0134,
 	TPM2_CC_NV_EXTEND	= 0x0136,
 	TPM2_CC_NV_WRITE	= 0x0137,
 	TPM2_CC_FLUSH_CONTEXT	= 0x0165,
@@ -873,6 +874,26 @@ u32 tpm2_nv_read_public(struct udevice *dev, u32 index,
  * @handle	handle to flush
  * Return: code of the operation
  */
+/**
+ * tpm2_nv_increment() - TPM2_NV_Increment on a counter index, authorised by
+ * a policy session that has satisfied PolicyAuthValue (HMAC proof of the
+ * index authValue; the value itself is never sent). Same authorisation
+ * construction as tpm2_nv_extend(), without a data parameter.
+ *
+ * @dev		TPM device
+ * @index	NV index (without HR_NV_INDEX)
+ * @nv_name	Name of the NV index (from tpm2_nv_read_public)
+ * @nv_name_len	Length of @nv_name
+ * @auth_value	index authValue (HMAC key)
+ * @auth_len	Length of @auth_value (<= 64)
+ * @session	policy session (nonces are consumed)
+ * Return: TPM2 response code, 0 on success
+ */
+u32 tpm2_nv_increment(struct udevice *dev, u32 index,
+		      const u8 *nv_name, u32 nv_name_len,
+		      const u8 *auth_value, u32 auth_len,
+		      struct tpm2_auth_session *session);
+
 u32 tpm2_flush_context(struct udevice *dev, u32 handle);
 
 /**

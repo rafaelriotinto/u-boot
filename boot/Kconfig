@@ -847,6 +847,36 @@ if MEASURED_BOOT
 	  Offset of the NV extend index. The full handle is
 	  HR_NV_INDEX (0x01000000) + this value, e.g. 0x00c00000 -> 0x01c00000.
 
+	config ANTIROLLBACK
+	bool "Refuse to boot a release older than the highest one committed (TPM NV counter)"
+	depends on MEASURE_NV_EXTEND
+	help
+	  The platform firmware verifies the signature of boot.img but does
+	  not version it, so any owner-signed image, however old, boots. This
+	  option makes U-Boot compare a version compiled into itself against a
+	  monotonic TPM NV counter holding the highest version that has run
+	  committed on this board. Older: halt. Newer, on a committed (non
+	  tryboot) boot: advance the counter, authorised by a PolicyAuthValue
+	  session proving a DUID-derived secret. Any TPM error or a missing
+	  counter also halts (fail closed). Because U-Boot itself is signed,
+	  an attacker can only replay an old legitimate U-Boot, which carries
+	  its own copy of this check and halts itself.
+
+	config ANTIROLLBACK_VERSION
+	int "Security version of this release"
+	depends on ANTIROLLBACK
+	default 1
+	help
+	  Monotonic release number. Bump on every release. Never reuse.
+
+	config ANTIROLLBACK_NV_INDEX
+	hex "NV counter index (offset, HR_NV_INDEX added internally)"
+	depends on ANTIROLLBACK
+	default 0x00800002
+	help
+	  Offset of the TPM_NT_COUNTER NV index. Full handle is
+	  HR_NV_INDEX (0x01000000) + this value, e.g. 0x00800002 -> 0x01800002.
+
 	config MEASURE_SCRUB_DUID
 		bool "Remove /chosen/rpi-duid from the devicetree handed to the OS"
 		depends on MEASURE_NV_EXTEND

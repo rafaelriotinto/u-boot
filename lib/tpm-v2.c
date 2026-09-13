@@ -1308,6 +1308,78 @@ u32 tpm2_nv_extend(struct udevice *dev, u32 index,
 	return ret;
 }
 
+u32 tpm2_nv_increment(struct udevice *dev, u32 index,
+		      const u8 *nv_name, u32 nv_name_len,
+		      const u8 *auth_value, u32 auth_len,
+		      struct tpm2_auth_session *session)
+{
+	/*
+	 * Command layout (TPM2_ST_SESSIONS):
+	 *   header(10) | authHandle(4) | nvIndex(4) | authSize(4) |
+	 *   [ sessionHandle(4) | nonceCaller(TPM2B) | attrs(1) | hmac(TPM2B) ]
+	 * No parameters: cpHash = SHA256(CC || name || name).
+	 */
+	const u8 session_attrs = 0x01;		/* continueSession */
+	u32 nv_handle = HR_NV_INDEX + index;
+	u8 cp_hash[SHA256_SUM_LEN];
+	u8 auth_hmac[SHA256_SUM_LEN];
+	u8 hmac_msg[SHA256_SUM_LEN + 2 * TPM2_NONCE_SIZE + 1];
+	sha256_context ctx;
+	u8 be_cc[4];
+	u8 command_v2[COMMAND_BUFFER_SIZE];
+	u8 response[COMMAND_BUFFER_SIZE];
+	size_t response_len = sizeof(response);
+	uint auth_size, off, mlen;
+
+	if (auth_len > 64)
+		return TPM_LIB_ERROR;
+
+	put_unaligned_be32(TPM2_CC_NV_INCREMENT, be_cc);
+	sha256_starts(&ctx);
+	sha256_update(&ctx, be_cc, 4);
+	sha256_update(&ctx, nv_name, nv_name_len);
+	sha256_update(&ctx, nv_name, nv_name_len);
+	sha256_finish(&ctx, cp_hash);
+
+	mlen = 0;
+	memcpy(hmac_msg + mlen, cp_hash, SHA256_SUM_LEN);
+	mlen += SHA256_SUM_LEN;
+	memcpy(hmac_msg + mlen, session->nonce_caller,
+	       session->nonce_caller_size);
+	mlen += session->nonce_caller_size;
+	memcpy(hmac_msg + mlen, session->nonce_tpm, session->nonce_tpm_size);
+	mlen += session->nonce_tpm_size;
+	hmac_msg[mlen++] = session_attrs;
+
+	/* unsalted, unbound session: the HMAC key is the authValue alone */
+	hmac_sha256(auth_value, auth_len, hmac_msg, mlen, auth_hmac);
+
+	auth_size = 4 + 2 + session->nonce_caller_size + 1 + 2 + SHA256_SUM_LEN;
+
+	memset(command_v2, 0, sizeof(command_v2));
+	put_unaligned_be16(TPM2_ST_SESSIONS, command_v2 + 0);
+	put_unaligned_be32(TPM2_CC_NV_INCREMENT, command_v2 + 6);
+	put_unaligned_be32(nv_handle, command_v2 + 10);	/* authHandle */
+	put_unaligned_be32(nv_handle, command_v2 + 14);	/* nvIndex */
+	put_unaligned_be32(auth_size, command_v2 + 18);
+
+	off = 22;
+	put_unaligned_be32(session->handle, command_v2 + off); off += 4;
+	put_unaligned_be16(session->nonce_caller_size, command_v2 + off);
+	off += 2;
+	memcpy(command_v2 + off, session->nonce_caller,
+	       session->nonce_caller_size);
+	off += session->nonce_caller_size;
+	command_v2[off++] = session_attrs;
+	put_unaligned_be16(SHA256_SUM_LEN, command_v2 + off); off += 2;
+	memcpy(command_v2 + off, auth_hmac, SHA256_SUM_LEN);
+	off += SHA256_SUM_LEN;
+
+	put_unaligned_be32(off, command_v2 + 2);
+
+	return tpm_sendrecv_command(dev, command_v2, response, &response_len);
+}
+
 u32 tpm2_flush_context(struct udevice *dev, u32 handle)
 {
 	u8 command_v2[14] = {

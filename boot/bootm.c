@@ -12,6 +12,7 @@
 #include <command.h>
 #include <cpu_func.h>
 #include <dm.h>
+#include <hang.h>
 #include <env.h>
 #include <errno.h>
 #include <fdt_support.h>
@@ -1123,7 +1124,9 @@ static int tcg2_measure_dtb_sanitized(struct udevice *dev,
  * never carried on removable media. The provisioning step derives the same
  * value identically. See docs/hardening-and-secret-storage.md.
  */
-static int measure_factory_secret(const void *fdt, u8 secret[TPM2_DIGEST_LEN])
+/* secret = SHA256(context || DUID bytes incl. NUL); one context per index */
+static int measure_derive_secret(const void *fdt, const char *context,
+				 u8 secret[TPM2_DIGEST_LEN])
 {
 	sha256_context ctx;
 	const void *duid;
@@ -1137,11 +1140,15 @@ static int measure_factory_secret(const void *fdt, u8 secret[TPM2_DIGEST_LEN])
 		return -1;
 
 	sha256_starts(&ctx);
-	sha256_update(&ctx, (const u8 *)MEASURE_NV_AUTH_CTX,
-		      strlen(MEASURE_NV_AUTH_CTX));
+	sha256_update(&ctx, (const u8 *)context, strlen(context));
 	sha256_update(&ctx, duid, len);
 	sha256_finish(&ctx, secret);
 	return 0;
+}
+
+static int measure_factory_secret(const void *fdt, u8 secret[TPM2_DIGEST_LEN])
+{
+	return measure_derive_secret(fdt, MEASURE_NV_AUTH_CTX, secret);
 }
 
 /*
@@ -1257,6 +1264,102 @@ static int measure_nv_extend(struct udevice *dev, const void *fdt)
 	return rc;
 }
 
+#if CONFIG_IS_ENABLED(ANTIROLLBACK)
+#define ANTIROLLBACK_AUTH_CTX	"rp5-nv-counter-v1"
+
+/*
+ * Anti-rollback: the platform firmware signs but does not version boot.img.
+ * Compare this build's CONFIG_ANTIROLLBACK_VERSION against a monotonic TPM NV
+ * counter holding the highest version that has run COMMITTED on this board.
+ *
+ *   version <  counter : an older release is being replayed -> halt.
+ *   version == counter : boot.
+ *   version >  counter : a newer release. On a committed boot (the firmware's
+ *                        tryboot flag is 0) advance the counter to version;
+ *                        on a tryboot leave it alone, so that a failed trial
+ *                        can still fall back to the committed (older) pair.
+ *
+ * Reads are open (ppread). The increment is authorised by a PolicyAuthValue
+ * session proving SHA256("rp5-nv-counter-v1" || DUID), so only a U-Boot that
+ * can derive the board secret advances the counter: nobody can burn versions
+ * to brick the board, and a lifted TPM cannot be bumped elsewhere.
+ * Fail closed: a missing or unreadable counter, or any TPM error, halts.
+ */
+static bool antirollback_tryboot(const void *fdt)
+{
+	const u32 *p;
+	int node, len;
+
+	node = fdt_path_offset(fdt, "/chosen/bootloader");
+	p = node >= 0 ? fdt_getprop(fdt, node, "tryboot", &len) : NULL;
+	return p && len == sizeof(u32) && fdt32_to_cpu(*p) != 0;
+}
+
+static void antirollback_check(struct udevice *dev, const void *fdt)
+{
+	const u64 version = CONFIG_ANTIROLLBACK_VERSION;
+	struct tpm2_auth_session session;
+	u8 secret[TPM2_DIGEST_LEN];
+	u8 nv_name[68];
+	u32 nv_name_len = sizeof(nv_name);
+	u8 raw[8];
+	u64 counter, i;
+	u32 rc;
+
+	rc = tpm2_nv_read_value(dev, CONFIG_ANTIROLLBACK_NV_INDEX, raw, sizeof(raw));
+	if (rc) {
+		printf("[ARB] counter read failed 0x%x -- no anti-rollback state; halting\n", rc);
+		hang();
+	}
+	counter = get_unaligned_be64(raw);
+	printf("[ARB] this release: version %llu; board counter: %llu%s\n",
+	       version, counter, antirollback_tryboot(fdt) ? " (tryboot)" : "");
+
+	if (version < counter) {
+		printf("[ARB] ROLLBACK: this release is older than one already committed; halting\n");
+		hang();
+	}
+	if (version == counter)
+		return;
+	if (antirollback_tryboot(fdt)) {
+		printf("[ARB] trial boot: counter left at %llu until committed\n", counter);
+		return;
+	}
+
+	if (measure_derive_secret(fdt, ANTIROLLBACK_AUTH_CTX, secret)) {
+		printf("[ARB] no rpi-duid: cannot authorise the counter; halting\n");
+		hang();
+	}
+	rc = tpm2_nv_read_public(dev, CONFIG_ANTIROLLBACK_NV_INDEX,
+				 nv_name, &nv_name_len);
+	for (i = counter; !rc && i < version; i++) {
+		rc = tpm2_start_auth_session(dev, TPM_SE_POLICY, &session);
+		if (!rc)
+			rc = tpm2_policy_auth_value(dev, &session);
+		if (!rc)
+			rc = tpm2_nv_increment(dev, CONFIG_ANTIROLLBACK_NV_INDEX,
+					       nv_name, nv_name_len,
+					       secret, TPM2_DIGEST_LEN, &session);
+		tpm2_flush_context(dev, session.handle);
+	}
+	memset(secret, 0, sizeof(secret));
+	memset(&session, 0, sizeof(session));
+	if (rc) {
+		printf("[ARB] counter increment failed 0x%x; halting\n", rc);
+		hang();
+	}
+	/* read back: the counter is the truth, not our loop */
+	rc = tpm2_nv_read_value(dev, CONFIG_ANTIROLLBACK_NV_INDEX, raw, sizeof(raw));
+	if (rc || get_unaligned_be64(raw) != version) {
+		printf("[ARB] counter did not reach %llu; halting\n", version);
+		hang();
+	}
+	printf("[ARB] counter advanced to %llu (committed)\n", version);
+}
+#else
+static inline void antirollback_check(struct udevice *dev, const void *fdt) { }
+#endif
+
 #if CONFIG_IS_ENABLED(MEASURE_SCRUB_DUID)
 /*
  * Remove the source of the board secret from the devicetree handed to the OS.
@@ -1345,6 +1448,10 @@ int bootm_measure(struct bootm_headers *images)
 			free(elog.log);
 			return ret;
 		}
+
+		/* before anything of this release is measured or loaded */
+		if (images->ft_addr)
+			antirollback_check(dev, images->ft_addr);
 
 		/*
 		 * bootm sets os.image_start/image_len (via boot_get_kernel),
