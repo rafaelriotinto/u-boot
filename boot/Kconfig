@@ -851,6 +851,17 @@ if MEASURED_BOOT
 	  next reset; if the locks cannot be verified the board resets.
 	  The indices must be provisioned with the matching PolicySigned policy.
 
+	config RPI_FACTORY_GUARD
+	bool "Factory image: refuse to start a kernel once the firmware key exists"
+	depends on ARCH_BCM283X && !MEASURE_NV_AUTH_FWKEY
+	help
+	  For the FACTORY U-Boot only. The factory image must leave the
+	  firmware key usable, because provisioning generates it and signs
+	  the first counter increment. Once the key exists (OTP, permanent),
+	  this U-Boot refuses to start a kernel and resets, so an owner-signed
+	  factory image can never again give Linux an unlocked key on a
+	  provisioned board, even with the TPM removed.
+
 	config CMD_RPI_FWCRYPTO
 	bool "fwcrypto test command (development only)"
 	depends on ARCH_BCM283X

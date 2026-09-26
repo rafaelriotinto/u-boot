@@ -273,6 +273,27 @@ void board_quiesce_devices(void)
 }
 #endif
 
+#if CONFIG_IS_ENABLED(RPI_FACTORY_GUARD)
+#include <bootm.h>
+#include <hang.h>
+#include <linux/delay.h>
+/* Factory U-Boot: only a board whose firmware key slot is still blank may run the factory image. */
+void board_quiesce_devices(void)
+{
+	u8 pub[RPI_FWC_PUBKEY_MAX];
+	size_t len;
+
+	if (!rpi_fwc_get_pubkey(RPI_FWC_KEY_DEVICE, pub, sizeof(pub), &len)) {
+		printf("[FACTORY] this board is already provisioned (firmware key present) -- "
+		       "refusing to start the factory image; resetting\n");
+		mdelay(500);
+		do_reset(NULL, 0, 0, NULL);
+		hang();
+	}
+	printf("[FACTORY] firmware key slot blank: factory image allowed\n");
+}
+#endif
+
 #if CONFIG_IS_ENABLED(CMDLINE) && IS_ENABLED(CONFIG_CMD_RPI_FWCRYPTO)
 static void set_hex_env(const char *name, const u8 *buf, size_t len)
 {
