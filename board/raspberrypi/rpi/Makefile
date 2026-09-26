@@ -4,3 +4,4 @@
 
 obj-y	:= rpi.o
 obj-y	+= lowlevel_init.o
+obj-y	+= rpi_fwcrypto.o
