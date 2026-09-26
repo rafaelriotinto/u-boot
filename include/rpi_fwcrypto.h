@@ -39,4 +39,17 @@ int rpi_fwc_last_error(void);
 /* Convert a DER ECDSA signature to fixed 32-byte r and s (big-endian). */
 int rpi_fwc_der_to_rs(const u8 *der, size_t len, u8 r[32], u8 s[32]);
 
+struct udevice;
+struct tpm2_auth_session;
+/*
+ * Open a TPM policy session and satisfy TPM2_PolicySigned with a signature made by the
+ * firmware over SHA256(nonceTPM || 0 || cp_hash || policy_ref). The firmware public key is
+ * loaded into TPM_RH_NULL; *key_handle must be flushed by the caller, as must the session.
+ */
+int rpi_fwc_policy_signed_session(struct udevice *dev, const u8 cp_hash[32],
+				  const char *policy_ref, struct tpm2_auth_session *session,
+				  u32 *key_handle);
+/* Extract x, y from the firmware's DER P-256 SubjectPublicKeyInfo (91 bytes). */
+int rpi_fwc_pubkey_xy(u32 key_id, u8 x[32], u8 y[32]);
+
 #endif

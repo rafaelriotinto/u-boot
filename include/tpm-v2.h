@@ -352,7 +352,9 @@ enum tpm2_command_codes {
 	TPM2_CC_NV_INCREMENT	= 0x0134,
 	TPM2_CC_NV_EXTEND	= 0x0136,
 	TPM2_CC_NV_WRITE	= 0x0137,
+	TPM2_CC_POLICY_SIGNED	= 0x0160,
 	TPM2_CC_FLUSH_CONTEXT	= 0x0165,
+	TPM2_CC_LOAD_EXTERNAL	= 0x0167,
 	TPM2_CC_NV_READ_PUBLIC	= 0x0169,
 	TPM2_CC_POLICY_AUTH_VALUE = 0x016B,
 	TPM2_CC_START_AUTH_SESSION = 0x0176,
@@ -895,6 +897,41 @@ u32 tpm2_nv_increment(struct udevice *dev, u32 index,
 		      struct tpm2_auth_session *session);
 
 u32 tpm2_flush_context(struct udevice *dev, u32 handle);
+
+/*
+ * Board-bound authorisation with TPM2_PolicySigned (key held by the SoC firmware).
+ * The public key is loaded into the NULL hierarchy with a fixed public area, so
+ * that its Name, and hence the policy digest fixed at provisioning, is stable:
+ *   TPMT_PUBLIC = ECC | SHA256 | TPM2_ECC_PUB_ATTRS | authPolicy{} | sym NULL |
+ *                 scheme NULL | NIST P-256 | kdf NULL | x | y
+ */
+#define TPM2_ALG_ECDSA_ID	0x0018
+#define TPM2_ALG_ECC_ID		0x0023
+#define TPM2_ECC_NIST_P256_ID	0x0003
+#define TPM2_ECC_PUB_ATTRS	0x00040040	/* sign | userWithAuth */
+#define TPM2_ECC_P256_PUBLIC_SIZE	86
+#define TPM2_SHA256_NAME_SIZE	(2 + 32)
+
+/* Encode the fixed TPMT_PUBLIC for a P-256 verification key (86 bytes). */
+void tpm2_ecc_p256_public(const u8 x[32], const u8 y[32], u8 out[TPM2_ECC_P256_PUBLIC_SIZE]);
+/* Name = nameAlg(SHA-256) || SHA256(TPMT_PUBLIC), computed locally (not trusted from the bus). */
+void tpm2_ecc_p256_name(const u8 x[32], const u8 y[32], u8 name[TPM2_SHA256_NAME_SIZE]);
+/* TPM2_LoadExternal of the public key into TPM_RH_NULL; returns the transient handle. */
+u32 tpm2_load_external_ecc_p256(struct udevice *dev, const u8 x[32], const u8 y[32],
+				u32 *handle);
+/* cpHash of TPM2_NV_Extend(index self-authorised, data) and of TPM2_NV_Increment. */
+void tpm2_nv_extend_cphash(const u8 *nv_name, u32 nv_name_len, const void *data,
+			   u32 count, u8 out[32]);
+void tpm2_nv_increment_cphash(const u8 *nv_name, u32 nv_name_len, u8 out[32]);
+/* aHash = SHA256(nonceTPM || expiration || cpHashA || policyRef), the digest to be signed. */
+void tpm2_policy_signed_ahash(const struct tpm2_auth_session *session, s32 expiration,
+			      const u8 *cp_hash, const u8 *policy_ref, u16 policy_ref_len,
+			      u8 out[32]);
+/* TPM2_PolicySigned with an ECDSA-P256/SHA-256 signature (r, s) by auth_object. */
+u32 tpm2_policy_signed(struct udevice *dev, struct tpm2_auth_session *session,
+		       u32 auth_object, s32 expiration, const u8 *cp_hash,
+		       const u8 *policy_ref, u16 policy_ref_len,
+		       const u8 sig_r[32], const u8 sig_s[32]);
 
 /**
  * Issue a TPM2_PCR_Read command.

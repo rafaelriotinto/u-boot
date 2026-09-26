@@ -1396,6 +1396,160 @@ u32 tpm2_flush_context(struct udevice *dev, u32 handle)
 	return tpm_sendrecv_command(dev, command_v2, response, &response_len);
 }
 
+void tpm2_ecc_p256_public(const u8 x[32], const u8 y[32], u8 out[TPM2_ECC_P256_PUBLIC_SIZE])
+{
+	uint off = 0;
+
+	put_unaligned_be16(TPM2_ALG_ECC_ID, out + off); off += 2;	/* type */
+	put_unaligned_be16(TPM2_ALG_SHA256, out + off); off += 2;	/* nameAlg */
+	put_unaligned_be32(TPM2_ECC_PUB_ATTRS, out + off); off += 4;	/* objectAttributes */
+	put_unaligned_be16(0, out + off); off += 2;			/* authPolicy (empty) */
+	put_unaligned_be16(TPM2_ALG_NULL, out + off); off += 2;	/* symmetric */
+	put_unaligned_be16(TPM2_ALG_NULL, out + off); off += 2;	/* scheme */
+	put_unaligned_be16(TPM2_ECC_NIST_P256_ID, out + off); off += 2; /* curveID */
+	put_unaligned_be16(TPM2_ALG_NULL, out + off); off += 2;	/* kdf */
+	put_unaligned_be16(32, out + off); off += 2;			/* unique.x */
+	memcpy(out + off, x, 32); off += 32;
+	put_unaligned_be16(32, out + off); off += 2;			/* unique.y */
+	memcpy(out + off, y, 32); off += 32;
+}
+
+void tpm2_ecc_p256_name(const u8 x[32], const u8 y[32], u8 name[TPM2_SHA256_NAME_SIZE])
+{
+	u8 pub[TPM2_ECC_P256_PUBLIC_SIZE];
+
+	tpm2_ecc_p256_public(x, y, pub);
+	put_unaligned_be16(TPM2_ALG_SHA256, name);
+	sha256_csum_wd(pub, sizeof(pub), name + 2, CHUNKSZ_SHA256);
+}
+
+u32 tpm2_load_external_ecc_p256(struct udevice *dev, const u8 x[32], const u8 y[32],
+				u32 *handle)
+{
+	/*
+	 * header(10) | inPrivate(TPM2B, empty) | inPublic(TPM2B: TPMT_PUBLIC) |
+	 * hierarchy(4) -> response header(10) | objectHandle(4) | name(TPM2B)
+	 */
+	u8 command_v2[COMMAND_BUFFER_SIZE];
+	u8 response[COMMAND_BUFFER_SIZE];
+	size_t response_len = sizeof(response);
+	uint off = 10;
+	u32 ret;
+
+	memset(command_v2, 0, sizeof(command_v2));
+	put_unaligned_be16(TPM2_ST_NO_SESSIONS, command_v2);
+	put_unaligned_be32(TPM2_CC_LOAD_EXTERNAL, command_v2 + 6);
+	put_unaligned_be16(0, command_v2 + off); off += 2;		/* inPrivate */
+	put_unaligned_be16(TPM2_ECC_P256_PUBLIC_SIZE, command_v2 + off); off += 2;
+	tpm2_ecc_p256_public(x, y, command_v2 + off);
+	off += TPM2_ECC_P256_PUBLIC_SIZE;
+	put_unaligned_be32(TPM2_RH_NULL, command_v2 + off); off += 4;	/* hierarchy */
+	put_unaligned_be32(off, command_v2 + 2);
+
+	ret = tpm_sendrecv_command(dev, command_v2, response, &response_len);
+	if (ret)
+		return ret;
+	if (unpack_byte_string(response, response_len, "d", 10, handle))
+		return TPM_LIB_ERROR;
+	return 0;
+}
+
+void tpm2_nv_extend_cphash(const u8 *nv_name, u32 nv_name_len, const void *data,
+			   u32 count, u8 out[32])
+{
+	sha256_context ctx;
+	u8 be_cc[4], be_count[2];
+
+	put_unaligned_be32(TPM2_CC_NV_EXTEND, be_cc);
+	put_unaligned_be16(count, be_count);
+	sha256_starts(&ctx);
+	sha256_update(&ctx, be_cc, 4);
+	sha256_update(&ctx, nv_name, nv_name_len);	/* authHandle == nvIndex */
+	sha256_update(&ctx, nv_name, nv_name_len);
+	sha256_update(&ctx, be_count, 2);
+	sha256_update(&ctx, data, count);
+	sha256_finish(&ctx, out);
+}
+
+void tpm2_nv_increment_cphash(const u8 *nv_name, u32 nv_name_len, u8 out[32])
+{
+	sha256_context ctx;
+	u8 be_cc[4];
+
+	put_unaligned_be32(TPM2_CC_NV_INCREMENT, be_cc);
+	sha256_starts(&ctx);
+	sha256_update(&ctx, be_cc, 4);
+	sha256_update(&ctx, nv_name, nv_name_len);
+	sha256_update(&ctx, nv_name, nv_name_len);
+	sha256_finish(&ctx, out);
+}
+
+void tpm2_policy_signed_ahash(const struct tpm2_auth_session *session, s32 expiration,
+			      const u8 *cp_hash, const u8 *policy_ref, u16 policy_ref_len,
+			      u8 out[32])
+{
+	sha256_context ctx;
+	u8 be_exp[4];
+
+	put_unaligned_be32((u32)expiration, be_exp);
+	sha256_starts(&ctx);
+	sha256_update(&ctx, session->nonce_tpm, session->nonce_tpm_size);
+	sha256_update(&ctx, be_exp, 4);
+	if (cp_hash)
+		sha256_update(&ctx, cp_hash, SHA256_SUM_LEN);
+	if (policy_ref_len)
+		sha256_update(&ctx, policy_ref, policy_ref_len);
+	sha256_finish(&ctx, out);
+}
+
+u32 tpm2_policy_signed(struct udevice *dev, struct tpm2_auth_session *session,
+		       u32 auth_object, s32 expiration, const u8 *cp_hash,
+		       const u8 *policy_ref, u16 policy_ref_len,
+		       const u8 sig_r[32], const u8 sig_s[32])
+{
+	/*
+	 * header(10) | authObject(4) | policySession(4) | nonceTPM(TPM2B) |
+	 * cpHashA(TPM2B) | policyRef(TPM2B) | expiration(INT32) |
+	 * auth(TPMT_SIGNATURE: ECDSA | SHA256 | r(TPM2B) | s(TPM2B))
+	 * No authorisation area: use of authObject needs none.
+	 */
+	u8 command_v2[COMMAND_BUFFER_SIZE];
+	u8 response[COMMAND_BUFFER_SIZE];
+	size_t response_len = sizeof(response);
+	uint off = 18;
+
+	if (policy_ref_len > 64)
+		return TPM_LIB_ERROR;
+
+	memset(command_v2, 0, sizeof(command_v2));
+	put_unaligned_be16(TPM2_ST_NO_SESSIONS, command_v2);
+	put_unaligned_be32(TPM2_CC_POLICY_SIGNED, command_v2 + 6);
+	put_unaligned_be32(auth_object, command_v2 + 10);
+	put_unaligned_be32(session->handle, command_v2 + 14);
+
+	put_unaligned_be16(session->nonce_tpm_size, command_v2 + off); off += 2;
+	memcpy(command_v2 + off, session->nonce_tpm, session->nonce_tpm_size);
+	off += session->nonce_tpm_size;
+	if (cp_hash) {
+		put_unaligned_be16(SHA256_SUM_LEN, command_v2 + off); off += 2;
+		memcpy(command_v2 + off, cp_hash, SHA256_SUM_LEN); off += SHA256_SUM_LEN;
+	} else {
+		put_unaligned_be16(0, command_v2 + off); off += 2;
+	}
+	put_unaligned_be16(policy_ref_len, command_v2 + off); off += 2;
+	memcpy(command_v2 + off, policy_ref, policy_ref_len); off += policy_ref_len;
+	put_unaligned_be32((u32)expiration, command_v2 + off); off += 4;
+	put_unaligned_be16(TPM2_ALG_ECDSA_ID, command_v2 + off); off += 2;
+	put_unaligned_be16(TPM2_ALG_SHA256, command_v2 + off); off += 2;
+	put_unaligned_be16(32, command_v2 + off); off += 2;
+	memcpy(command_v2 + off, sig_r, 32); off += 32;
+	put_unaligned_be16(32, command_v2 + off); off += 2;
+	memcpy(command_v2 + off, sig_s, 32); off += 32;
+	put_unaligned_be32(off, command_v2 + 2);
+
+	return tpm_sendrecv_command(dev, command_v2, response, &response_len);
+}
+
 u32 tpm2_pcr_read(struct udevice *dev, u32 idx, unsigned int idx_min_sz,
 		  u16 algorithm, void *data, u32 digest_len,
 		  unsigned int *updates)

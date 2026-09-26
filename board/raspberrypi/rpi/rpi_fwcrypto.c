@@ -11,6 +11,9 @@
 #include <rpi_fwcrypto.h>
 #include <u-boot/sha256.h>
 #include <asm/arch/mbox.h>
+#include <dm.h>
+#include <tpm-v2.h>
+#include <tpm_api.h>
 #include <linux/errno.h>
 #include <linux/string.h>
 
@@ -175,6 +178,72 @@ int rpi_fwc_der_to_rs(const u8 *der, size_t len, u8 r[32], u8 s[32])
 	return 0;
 }
 
+
+/* DER prefix of a P-256 SubjectPublicKeyInfo up to and including the 0x04 point marker */
+static const u8 p256_spki_prefix[27] = {
+	0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,
+	0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04,
+};
+
+int rpi_fwc_pubkey_xy(u32 key_id, u8 x[32], u8 y[32])
+{
+	u8 der[RPI_FWC_PUBKEY_MAX];
+	size_t len;
+	int ret;
+
+	ret = rpi_fwc_get_pubkey(key_id, der, sizeof(der), &len);
+	if (ret)
+		return ret;
+	if (len != sizeof(p256_spki_prefix) + 64 ||
+	    memcmp(der, p256_spki_prefix, sizeof(p256_spki_prefix)))
+		return -EINVAL;
+	memcpy(x, der + sizeof(p256_spki_prefix), 32);
+	memcpy(y, der + sizeof(p256_spki_prefix) + 32, 32);
+	return 0;
+}
+
+int rpi_fwc_policy_signed_session(struct udevice *dev, const u8 cp_hash[32],
+				  const char *policy_ref, struct tpm2_auth_session *session,
+				  u32 *key_handle)
+{
+	u8 x[32], y[32], ahash[32], der[RPI_FWC_SIG_MAX], r[32], s[32];
+	u16 ref_len = policy_ref ? strlen(policy_ref) : 0;
+	size_t der_len;
+	int ret;
+
+	*key_handle = 0;
+	session->handle = 0;
+	ret = rpi_fwc_pubkey_xy(RPI_FWC_KEY_DEVICE, x, y);
+	if (ret)
+		return ret;
+	ret = tpm2_load_external_ecc_p256(dev, x, y, key_handle);
+	if (ret)
+		goto fail;
+	ret = tpm2_start_auth_session(dev, TPM_SE_POLICY, session);
+	if (ret)
+		goto fail;
+	tpm2_policy_signed_ahash(session, 0, cp_hash, (const u8 *)policy_ref, ref_len, ahash);
+	ret = rpi_fwc_sign(RPI_FWC_KEY_DEVICE, ahash, der, sizeof(der), &der_len);
+	if (ret)
+		goto fail;
+	ret = rpi_fwc_der_to_rs(der, der_len, r, s);
+	if (ret)
+		goto fail;
+	ret = tpm2_policy_signed(dev, session, *key_handle, 0, cp_hash,
+				 (const u8 *)policy_ref, ref_len, r, s);
+	if (ret)
+		goto fail;
+	return 0;
+fail:
+	if (session->handle)
+		tpm2_flush_context(dev, session->handle);
+	if (*key_handle)
+		tpm2_flush_context(dev, *key_handle);
+	session->handle = 0;
+	*key_handle = 0;
+	return ret ? ret : -EIO;
+}
+
 #if CONFIG_IS_ENABLED(CMDLINE)
 static void set_hex_env(const char *name, const u8 *buf, size_t len)
 {
@@ -265,13 +334,57 @@ static int do_fwcrypto(struct cmd_tbl *cmdtp, int flag, int argc, char *const ar
 		env_set_hex("fwc_lock", st);
 		return 0;
 	}
+	if (!strcmp(argv[1], "tpmtest") && argc == 3) {
+		/* Signed NV_Extend of a fixed value into the index at HR_NV_INDEX + offset */
+		static const char ref[] = "rp5-nv-meas-v1";
+		static const char tmsg[] = "u-boot policysigned nv-extend test";
+		u32 off = hextoul(argv[2], NULL), key_handle, rc;
+		struct tpm2_auth_session session;
+		u8 nv_name[68], name[TPM2_SHA256_NAME_SIZE], x[32], y[32], data[32], cph[32];
+		u32 nv_name_len = sizeof(nv_name);
+		struct udevice *dev;
+
+		if (uclass_first_device_err(UCLASS_TPM, &dev)) {
+			env_set("fwc_tpmtest", "no-tpm");
+			return CMD_RET_FAILURE;
+		}
+		rc = tpm_auto_start(dev);
+		env_set_hex("fwc_tpm_start", rc);
+		if (!rpi_fwc_pubkey_xy(RPI_FWC_KEY_DEVICE, x, y)) {
+			tpm2_ecc_p256_name(x, y, name);
+			set_hex_env("fwc_key_name", name, sizeof(name));
+		}
+		sha256_csum_wd((const u8 *)tmsg, sizeof(tmsg) - 1, data, CHUNKSZ_SHA256);
+		set_hex_env("fwc_ext_data", data, 32);
+		rc = tpm2_nv_read_public(dev, off, nv_name, &nv_name_len);
+		if (rc) {
+			env_set_hex("fwc_tpmtest", rc);
+			printf("fwcrypto: nv_read_public 0x%x failed 0x%x\n", off, rc);
+			return CMD_RET_FAILURE;
+		}
+		set_hex_env("fwc_nv_name", nv_name, nv_name_len);
+		tpm2_nv_extend_cphash(nv_name, nv_name_len, data, 32, cph);
+		ret = rpi_fwc_policy_signed_session(dev, cph, ref, &session, &key_handle);
+		if (ret) {
+			env_set_hex("fwc_tpmtest", (u32)ret);
+			printf("fwcrypto: policy-signed session failed 0x%x\n", ret);
+			return CMD_RET_FAILURE;
+		}
+		rc = tpm2_nv_extend(dev, off, nv_name, nv_name_len, NULL, 0, &session, data, 32);
+		tpm2_flush_context(dev, session.handle);
+		tpm2_flush_context(dev, key_handle);
+		env_set_hex("fwc_tpmtest", rc);
+		printf("fwcrypto: signed NV extend %s (0x%x)\n", rc ? "FAILED" : "OK", rc);
+		return rc ? CMD_RET_FAILURE : 0;
+	}
 	return CMD_RET_USAGE;
 }
 
-U_BOOT_CMD(fwcrypto, 2, 0, do_fwcrypto,
+U_BOOT_CMD(fwcrypto, 3, 0, do_fwcrypto,
 	   "Raspberry Pi firmware crypto service (OTP key)",
 	   "status    - key status bits\n"
 	   "fwcrypto pubkey    - public key (DER) into $fwc_pubkey\n"
 	   "fwcrypto sign-test - sign SHA-256 of a fixed string, into $fwc_sig / $fwc_sig_rs\n"
-	   "fwcrypto lock      - set READ/SIGN/HMAC/GEN/USAGE locks until reset and verify");
+	   "fwcrypto lock      - set READ/SIGN/HMAC/GEN/USAGE locks until reset and verify\n"
+	   "fwcrypto tpmtest <nv offset> - PolicySigned NV_Extend of a fixed value");
 #endif
