@@ -244,7 +244,36 @@ fail:
 	return ret ? ret : -EIO;
 }
 
-#if CONFIG_IS_ENABLED(CMDLINE)
+#if CONFIG_IS_ENABLED(MEASURE_NV_AUTH_FWKEY)
+#include <bootm.h>
+#include <hang.h>
+#include <cpu_func.h>
+#include <linux/delay.h>
+/*
+ * Runs on every ARM boot path immediately before "Starting kernel". Nothing after
+ * U-Boot may use the firmware key until the next reset: lock every operation, read
+ * the status back, and refuse to start the kernel if the locks are not all in place.
+ */
+void board_quiesce_devices(void)
+{
+	u32 st = 0;
+	int ret;
+
+	ret = rpi_fwc_set_key_status(RPI_FWC_KEY_DEVICE, RPI_FWC_STATUS_ALL_LOCKS);
+	if (!ret)
+		ret = rpi_fwc_get_key_status(RPI_FWC_KEY_DEVICE, &st);
+	if (ret || (st & RPI_FWC_STATUS_ALL_LOCKS) != RPI_FWC_STATUS_ALL_LOCKS) {
+		printf("[FWKEY] could not lock the firmware key (ret %d, status 0x%08x) -- "
+		       "refusing to start the kernel; resetting\n", ret, st);
+		mdelay(500);
+		do_reset(NULL, 0, 0, NULL);
+		hang();
+	}
+	printf("[FWKEY] firmware key locked until reset (status 0x%08x)\n", st);
+}
+#endif
+
+#if CONFIG_IS_ENABLED(CMDLINE) && IS_ENABLED(CONFIG_CMD_RPI_FWCRYPTO)
 static void set_hex_env(const char *name, const u8 *buf, size_t len)
 {
 	char *hex = malloc(2 * len + 1);

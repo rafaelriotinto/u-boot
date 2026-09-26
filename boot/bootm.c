@@ -28,6 +28,9 @@
 #include <asm/io.h>
 #include <linux/sizes.h>
 #include <tpm-v2.h>
+#if CONFIG_IS_ENABLED(MEASURE_NV_AUTH_FWKEY)
+#include <rpi_fwcrypto.h>
+#endif
 #include <u-boot/sha256.h>
 #if defined(CONFIG_CMD_USB)
 #include <usb.h>
@@ -1136,6 +1139,7 @@ static int tcg2_measure_dtb_sanitized(struct udevice *dev,
 /* Domain-separation context for the DUID-derived NV authValue. Must match the
  * provisioning step (provisioning/nv-extend/provision-nv-index.sh). */
 #define MEASURE_NV_AUTH_CTX	"rp5-nv-auth-v1"
+#define MEASURE_NV_POLICY_REF	"rp5-nv-meas-v1"
 
 /*
  * Derive the NV index authValue ("factory secret") from the SoC DUID that the
@@ -1166,7 +1170,7 @@ static int measure_derive_secret(const void *fdt, const char *context,
 	return 0;
 }
 
-static int measure_factory_secret(const void *fdt, u8 secret[TPM2_DIGEST_LEN])
+static int __maybe_unused measure_factory_secret(const void *fdt, u8 secret[TPM2_DIGEST_LEN])
 {
 	return measure_derive_secret(fdt, MEASURE_NV_AUTH_CTX, secret);
 }
@@ -1247,10 +1251,14 @@ static int measure_nv_extend(struct udevice *dev, const void *fdt)
 	u32 nv_name_len = sizeof(nv_name);
 	u32 rc;
 
+#if CONFIG_IS_ENABLED(MEASURE_NV_AUTH_FWKEY)
+	memset(secret, 0, sizeof(secret));
+#else
 	if (measure_factory_secret(fdt, secret)) {
 		printf("[MBOOT] no rpi-duid: cannot derive NV secret, skipping\n");
 		return -1;
 	}
+#endif
 
 	if (measure_nv_compose(dev, digest))
 		return -1;
@@ -1261,6 +1269,25 @@ static int measure_nv_extend(struct udevice *dev, const void *fdt)
 		printf("[MBOOT] NV read_public failed 0x%x\n", rc);
 		return rc;
 	}
+#if CONFIG_IS_ENABLED(MEASURE_NV_AUTH_FWKEY)
+	{
+		u8 cph[TPM2_DIGEST_LEN];
+		u32 key_handle;
+		int ret;
+
+		tpm2_nv_extend_cphash(nv_name, nv_name_len, digest, TPM2_DIGEST_LEN, cph);
+		ret = rpi_fwc_policy_signed_session(dev, cph, MEASURE_NV_POLICY_REF,
+						    &session, &key_handle);
+		if (ret) {
+			printf("[MBOOT] NV PolicySigned session failed %d\n", ret);
+			return -1;
+		}
+		rc = tpm2_nv_extend(dev, CONFIG_MEASURE_NV_INDEX, nv_name, nv_name_len,
+				    NULL, 0, &session, digest, TPM2_DIGEST_LEN);
+		tpm2_flush_context(dev, session.handle);
+		tpm2_flush_context(dev, key_handle);
+	}
+#else
 	rc = tpm2_start_auth_session(dev, TPM_SE_POLICY, &session);
 	if (rc) {
 		printf("[MBOOT] NV start_auth_session failed 0x%x\n", rc);
@@ -1273,6 +1300,7 @@ static int measure_nv_extend(struct udevice *dev, const void *fdt)
 				    secret, TPM2_DIGEST_LEN,
 				    &session, digest, TPM2_DIGEST_LEN);
 	tpm2_flush_context(dev, session.handle);
+#endif
 	/* The secret has served its one purpose; do not leave it on the stack. */
 	memset(secret, 0, sizeof(secret));
 	memset(&session, 0, sizeof(session));
@@ -1286,6 +1314,7 @@ static int measure_nv_extend(struct udevice *dev, const void *fdt)
 
 #if CONFIG_IS_ENABLED(ANTIROLLBACK)
 #define ANTIROLLBACK_AUTH_CTX	"rp5-nv-counter-v1"
+#define ANTIROLLBACK_POLICY_REF	"rp5-nv-ctr-v1"
 
 /*
  * Anti-rollback: the platform firmware signs but does not version boot.img.
@@ -1356,6 +1385,26 @@ static void antirollback_check(struct udevice *dev, const void *fdt)
 		return;
 	}
 
+#if CONFIG_IS_ENABLED(MEASURE_NV_AUTH_FWKEY)
+	memset(secret, 0, sizeof(secret));
+	rc = tpm2_nv_read_public(dev, CONFIG_ANTIROLLBACK_NV_INDEX,
+				 nv_name, &nv_name_len);
+	for (i = counter; !rc && i < version; i++) {
+		u8 cph[TPM2_DIGEST_LEN];
+		u32 key_handle;
+
+		tpm2_nv_increment_cphash(nv_name, nv_name_len, cph);
+		if (rpi_fwc_policy_signed_session(dev, cph, ANTIROLLBACK_POLICY_REF,
+						  &session, &key_handle)) {
+			rc = (u32)-EIO;
+			break;
+		}
+		rc = tpm2_nv_increment(dev, CONFIG_ANTIROLLBACK_NV_INDEX,
+				       nv_name, nv_name_len, NULL, 0, &session);
+		tpm2_flush_context(dev, session.handle);
+		tpm2_flush_context(dev, key_handle);
+	}
+#else
 	if (measure_derive_secret(fdt, ANTIROLLBACK_AUTH_CTX, secret)) {
 		antirollback_refuse("no rpi-duid: cannot authorise the counter");
 	}
@@ -1371,6 +1420,7 @@ static void antirollback_check(struct udevice *dev, const void *fdt)
 					       secret, TPM2_DIGEST_LEN, &session);
 		tpm2_flush_context(dev, session.handle);
 	}
+#endif
 	memset(secret, 0, sizeof(secret));
 	memset(&session, 0, sizeof(session));
 	if (rc) {

@@ -839,6 +839,26 @@ if MEASURED_BOOT
 	  index persists across reboots (reset by clear_stclear). Used by the
 	  measured-boot design of this project.
 
+	config MEASURE_NV_AUTH_FWKEY
+	bool "Authorise NV writes with the Raspberry Pi firmware key (TPM2_PolicySigned)"
+	depends on MEASURE_NV_EXTEND && ARCH_BCM283X
+	help
+	  Authorise the NV extend (and the anti-rollback increment) with a
+	  TPM2_PolicySigned session: the SoC firmware signs the TPM's fresh
+	  nonce, bound to the exact command, with an ECDSA P-256 key held in
+	  OTP (rpi-fw-crypto). No reusable secret is derived or sent on the
+	  bus. Before the kernel starts, all use of the key is locked until the
+	  next reset; if the locks cannot be verified the board resets.
+	  The indices must be provisioned with the matching PolicySigned policy.
+
+	config CMD_RPI_FWCRYPTO
+	bool "fwcrypto test command (development only)"
+	depends on ARCH_BCM283X
+	help
+	  Adds the "fwcrypto" command (status, pubkey, sign-test, lock, tpmtest)
+	  used to validate the firmware crypto service on a development board.
+	  It can sign arbitrary digests, so leave it out of release builds.
+
 	config MEASURE_NV_INDEX
 	hex "NV extend index (offset, HR_NV_INDEX added internally)"
 	depends on MEASURE_NV_EXTEND
