@@ -34,6 +34,8 @@ int rpi_fwc_set_key_status(u32 key_id, u32 status);
 int rpi_fwc_get_pubkey(u32 key_id, u8 *out, size_t max, size_t *len);
 /* ECDSA P-256 over a 32-byte digest; DER SEQUENCE { r, s } */
 int rpi_fwc_sign(u32 key_id, const u8 digest[32], u8 *sig, size_t max, size_t *len);
+/* HMAC-SHA256 of @msg (<= 2048 bytes) keyed by the firmware key @key_id; 32-byte result */
+int rpi_fwc_hmac(u32 key_id, const u8 *msg, size_t len, u8 out[32]);
 /* Last firmware crypto error code (RPI_FW_CRYPTO_STATUS), or negative on mailbox failure */
 int rpi_fwc_last_error(void);
 /* Convert a DER ECDSA signature to fixed 32-byte r and s (big-endian). */

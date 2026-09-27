@@ -851,9 +851,22 @@ if MEASURED_BOOT
 	  next reset; if the locks cannot be verified the board resets.
 	  The indices must be provisioned with the matching PolicySigned policy.
 
+	config MEASURE_NV_AUTH_FWHMAC
+	bool "Authorise NV writes with a secret computed by the Raspberry Pi firmware key (HMAC)"
+	depends on MEASURE_NV_EXTEND && ARCH_BCM283X && !MEASURE_NV_AUTH_FWKEY
+	help
+	  Authorise the NV extend (and the anti-rollback increment) with a
+	  PolicyAuthValue HMAC session whose authValue is
+	  HMAC-SHA256(OTP device key, context), computed by the SoC firmware
+	  (rpi-fw-crypto). The key never leaves the firmware; the 256-bit
+	  secret replaces the DUID-derived one. Before the kernel starts, all
+	  use of the key is locked until the next reset; if the locks cannot
+	  be verified the board resets. The indices must be provisioned with
+	  the PolicyAuthValue policy and the matching authValue.
+
 	config RPI_FACTORY_GUARD
 	bool "Factory image: refuse to start a kernel once the firmware key exists"
-	depends on ARCH_BCM283X && !MEASURE_NV_AUTH_FWKEY
+	depends on ARCH_BCM283X && !MEASURE_NV_AUTH_FWKEY && !MEASURE_NV_AUTH_FWHMAC
 	help
 	  For the FACTORY U-Boot only. The factory image must leave the
 	  firmware key usable, because provisioning generates it and signs

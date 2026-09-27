@@ -21,6 +21,8 @@
 #define TAG_GET_CRYPTO_KEY_STATUS	0x00030090
 #define TAG_SET_CRYPTO_KEY_STATUS	0x00038090
 #define TAG_GET_CRYPTO_ECDSA_SIGN	0x00030091
+#define TAG_GET_CRYPTO_HMAC_SHA256	0x00030092
+#define RPI_FWC_HMAC_MSG_MAX		2048
 #define TAG_GET_CRYPTO_PUBLIC_KEY	0x00030093
 
 #define VC_ERROR			0x80000000
@@ -39,6 +41,16 @@ struct fwc_sign_msg {
 	union {
 		struct { u32 flags, key_id, length; u8 hash[32]; } req;
 		struct { u32 status, length; u8 sig[RPI_FWC_SIG_MAX]; } resp;
+	} body;
+	u32 end_tag;
+};
+
+struct fwc_hmac_msg {
+	struct bcm2835_mbox_hdr hdr;
+	struct bcm2835_mbox_tag_hdr tag_hdr;
+	union {
+		struct { u32 flags, key_id, length; u8 message[RPI_FWC_HMAC_MSG_MAX]; } req;
+		struct { u32 status, length; u8 hmac[32]; } resp;
 	} body;
 	u32 end_tag;
 };
@@ -143,6 +155,28 @@ int rpi_fwc_sign(u32 key_id, const u8 digest[32], u8 *sig, size_t max, size_t *l
 	return 0;
 }
 
+int rpi_fwc_hmac(u32 key_id, const u8 *m, size_t len, u8 out[32])
+{
+	ALLOC_CACHE_ALIGN_BUFFER(struct fwc_hmac_msg, msg, 1);
+
+	if (len > RPI_FWC_HMAC_MSG_MAX)
+		return -EINVAL;
+	memset(msg, 0, sizeof(*msg));
+	/* as the reference library: the value buffer is the largest request */
+	fwc_hdr(&msg->hdr, &msg->tag_hdr, sizeof(*msg), TAG_GET_CRYPTO_HMAC_SHA256,
+		sizeof(msg->body.req));
+	msg->body.req.key_id = key_id;
+	msg->body.req.length = len;
+	memcpy(msg->body.req.message, m, len);
+	if (bcm2835_mbox_call_prop(BCM2835_MBOX_PROP_CHAN, &msg->hdr))
+		return -EIO;
+	if (msg->body.resp.status & VC_ERROR)
+		return -EACCES;
+	memcpy(out, msg->body.resp.hmac, 32);
+	memset(msg, 0, sizeof(*msg));
+	return 0;
+}
+
 /* DER: 30 L 02 Lr r 02 Ls s ; integers may carry a leading 00 or be shorter than 32 bytes */
 static int der_int(const u8 **p, const u8 *end, u8 out[32])
 {
@@ -244,7 +278,7 @@ fail:
 	return ret ? ret : -EIO;
 }
 
-#if CONFIG_IS_ENABLED(MEASURE_NV_AUTH_FWKEY)
+#if CONFIG_IS_ENABLED(MEASURE_NV_AUTH_FWKEY) || CONFIG_IS_ENABLED(MEASURE_NV_AUTH_FWHMAC)
 #include <bootm.h>
 #include <hang.h>
 #include <cpu_func.h>

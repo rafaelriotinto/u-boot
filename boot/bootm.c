@@ -28,7 +28,7 @@
 #include <asm/io.h>
 #include <linux/sizes.h>
 #include <tpm-v2.h>
-#if CONFIG_IS_ENABLED(MEASURE_NV_AUTH_FWKEY)
+#if CONFIG_IS_ENABLED(MEASURE_NV_AUTH_FWKEY) || CONFIG_IS_ENABLED(MEASURE_NV_AUTH_FWHMAC)
 #include <rpi_fwcrypto.h>
 #endif
 #include <u-boot/sha256.h>
@@ -1152,6 +1152,14 @@ static int tcg2_measure_dtb_sanitized(struct udevice *dev,
 static int measure_derive_secret(const void *fdt, const char *context,
 				 u8 secret[TPM2_DIGEST_LEN])
 {
+#if CONFIG_IS_ENABLED(MEASURE_NV_AUTH_FWHMAC)
+	/* secret = HMAC-SHA256(OTP device key, context), computed by the firmware */
+	int ret = rpi_fwc_hmac(RPI_FWC_KEY_DEVICE, (const u8 *)context, strlen(context), secret);
+
+	if (ret)
+		printf("[MBOOT] firmware HMAC failed %d\n", ret);
+	return ret ? -1 : 0;
+#else
 	sha256_context ctx;
 	const void *duid;
 	int node, len;
@@ -1168,6 +1176,7 @@ static int measure_derive_secret(const void *fdt, const char *context,
 	sha256_update(&ctx, duid, len);
 	sha256_finish(&ctx, secret);
 	return 0;
+#endif
 }
 
 static int __maybe_unused measure_factory_secret(const void *fdt, u8 secret[TPM2_DIGEST_LEN])
