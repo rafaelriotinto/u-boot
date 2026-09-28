@@ -1712,9 +1712,21 @@ int bootm_run_states(struct bootm_info *bmi, int states)
 				       bmi->conf_fdt);
 	}
 
+	/*
+	 * Fail closed: a measurement that cannot be completed (no TPM, a TPM
+	 * that does not respond, a failed extend) must not boot the kernel.
+	 * The anti-rollback check also needs the TPM, so continuing would boot
+	 * an older signed release unmeasured and unchecked. Reset as the ARB
+	 * refusal does: a trial boot falls back to the committed pair, and a
+	 * committed pair resets until the TPM works again.
+	 */
 	if (IS_ENABLED(CONFIG_MEASURED_BOOT) && !ret &&
-	    (states & BOOTM_STATE_MEASURE))
-		bootm_measure(images);
+	    (states & BOOTM_STATE_MEASURE) && bootm_measure(images)) {
+		printf("[MBOOT] measurement could not be completed -- refusing to boot; resetting\n");
+		mdelay(500);
+		do_reset(NULL, 0, 0, NULL);
+		hang();
+	}
 
 	/* Load the OS */
 	if (!ret && (states & BOOTM_STATE_LOADOS)) {
